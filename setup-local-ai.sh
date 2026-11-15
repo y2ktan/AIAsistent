@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-LLM_MODEL="${OLLAMA_LLM_MODEL:-llama3:latest}"
+LLM_MODEL="${OLLAMA_LLM_MODEL:-qwen3.8:latest}"
 EMBED_MODEL="${OLLAMA_EMBED_MODEL:-nomic-embed-text:latest}"
 EMBED_DIM="${OLLAMA_EMBED_DIM:-768}"
 STT_MODEL="${LOCAL_STT_MODEL:-Systran/faster-whisper-base}"

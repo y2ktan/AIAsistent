@@ -39,6 +39,10 @@ cp .env.example .env
 | `STUN_URLS` | Comma-separated STUN server URLs (default `stun:stun.l.google.com:19302`) |
 | `BACKEND_INTERNAL_URL` | Internal URL used by Next.js BFF to reach the Go backend (default `http://server:8080`) |
 
+## Local Ollama Setup
+
+Run `./setup-local-ai.sh` to configure the local AI stack. Its default LLM is `qwen3.8:latest`; override it with `OLLAMA_LLM_MODEL=<model-name> ./setup-local-ai.sh`. The script pulls the model if needed and updates the default agent configuration.
+
 ## One-Time Admin Bootstrap Flow
 
 1. Generate strong random secrets for `MASTER_ENCRYPTION_KEY` (`openssl rand -hex 32`) and `ADMIN_BOOTSTRAP_TOKEN` (`openssl rand -base64 24`).
