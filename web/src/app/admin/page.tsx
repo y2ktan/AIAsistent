@@ -525,10 +525,13 @@ export default function AdminPage() {
           <div className="space-y-6">
             <form
               onSubmit={handleCreateUser}
+              autoComplete="off"
               className="grid gap-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 md:grid-cols-4"
             >
               <input
                 type="email"
+                name="new-user-email"
+                autoComplete="off"
                 required
                 value={newEmail}
                 onChange={(e) => setNewEmail(e.target.value)}
@@ -537,6 +540,8 @@ export default function AdminPage() {
               />
               <input
                 type="password"
+                name="new-user-password"
+                autoComplete="new-password"
                 required
                 minLength={12}
                 value={newPassword}
@@ -1049,10 +1054,13 @@ export default function AdminPage() {
           <div className="space-y-6">
             <form
               onSubmit={handleAddMCP}
+              autoComplete="off"
               className="grid gap-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 md:grid-cols-5"
             >
               <input
                 type="text"
+                name="mcp-server-name"
+                autoComplete="off"
                 required
                 value={mcpName}
                 onChange={(e) => setMcpName(e.target.value)}
@@ -1069,6 +1077,8 @@ export default function AdminPage() {
               </select>
               <input
                 type="url"
+                name="mcp-server-url"
+                autoComplete="off"
                 required
                 value={mcpUrl}
                 onChange={(e) => setMcpUrl(e.target.value)}
@@ -1077,6 +1087,8 @@ export default function AdminPage() {
               />
               <input
                 type="password"
+                name="mcp-bearer-token"
+                autoComplete="new-password"
                 value={mcpAuth}
                 onChange={(e) => setMcpAuth(e.target.value)}
                 placeholder="Bearer token (optional)"
