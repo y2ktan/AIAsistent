@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -233,6 +234,182 @@ func (s *Server) HandleGetAgentConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+}
+
+func (s *Server) HandleDiscoverTTSVoices(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
+		return
+	}
+
+	baseURL := strings.TrimSpace(cfg.TTSBaseURL)
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(cfg.LLMBaseURL)
+	}
+	if baseURL == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+
+	policy := security.SSRFPolicy{AllowPrivate: s.allowPrivate}
+	endpoint := strings.TrimRight(baseURL, "/") + "/audio/voices"
+	if _, err := policy.ValidateHTTPURL(baseURL); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+	if _, err := policy.ValidateHTTPURL(endpoint); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+	if len(cfg.APIKeyCiphertext) > 0 {
+		key, err := s.vault.Decrypt(cfg.APIKeyCiphertext)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt provider api key"})
+			return
+		}
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+	}
+
+	resp, err := security.NewSafeHTTPClient(s.allowPrivate, 5*time.Second).Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+
+	var payload struct {
+		Voices []string `json:"voices"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "supported": false})
+		return
+	}
+	voices := uniqueNonEmptyStrings(payload.Voices)
+	writeJSON(w, http.StatusOK, map[string]any{"voices": voices, "supported": len(voices) > 0})
+}
+
+func (s *Server) HandleDiscoverSTTModels(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
+		return
+	}
+
+	baseURL := strings.TrimSpace(cfg.STTBaseURL)
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(cfg.LLMBaseURL)
+	}
+	if baseURL == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+
+	policy := security.SSRFPolicy{AllowPrivate: s.allowPrivate}
+	endpoint := strings.TrimRight(baseURL, "/") + "/models"
+	if _, err := policy.ValidateHTTPURL(baseURL); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+	if _, err := policy.ValidateHTTPURL(endpoint); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+	if len(cfg.APIKeyCiphertext) > 0 {
+		key, err := s.vault.Decrypt(cfg.APIKeyCiphertext)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt provider api key"})
+			return
+		}
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+	}
+
+	resp, err := security.NewSafeHTTPClient(s.allowPrivate, 5*time.Second).Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "supported": false})
+		return
+	}
+	models := prioritizeWhisperModels(payload.Data)
+	writeJSON(w, http.StatusOK, map[string]any{"models": models, "supported": len(models) > 0})
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func prioritizeWhisperModels(entries []struct {
+	ID string `json:"id"`
+}) []string {
+	models := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.ID) != "" {
+			models = append(models, strings.TrimSpace(entry.ID))
+		}
+	}
+	models = uniqueNonEmptyStrings(models)
+	sort.SliceStable(models, func(i, j int) bool {
+		return whisperModelPriority(models[i]) < whisperModelPriority(models[j])
+	})
+	return models
+}
+
+func whisperModelPriority(model string) int {
+	model = strings.ToLower(model)
+	if strings.HasPrefix(model, "systran/faster-whisper-") {
+		return 0
+	}
+	if strings.Contains(model, "whisper") {
+		return 1
+	}
+	return 2
 }
 
 func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {

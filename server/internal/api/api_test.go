@@ -102,8 +102,8 @@ func (m *mockAllStore) GetActiveSessionByTokenHash(_ context.Context, tokenHash 
 	return s, u, nil
 }
 
-func (m *mockAllStore) TouchSession(_ context.Context, _ string) error { return nil }
-func (m *mockAllStore) RevokeSession(_ context.Context, _ string) error { return nil }
+func (m *mockAllStore) TouchSession(_ context.Context, _ string) error          { return nil }
+func (m *mockAllStore) RevokeSession(_ context.Context, _ string) error         { return nil }
 func (m *mockAllStore) RevokeAllUserSessions(_ context.Context, _ string) error { return nil }
 
 func (m *mockAllStore) CreateSignalingToken(_ context.Context, tok *auth.SignalingToken) error {
@@ -225,8 +225,12 @@ func (m *mockAllStore) ReplaceVoiceLanguages(_ context.Context, cfg agent.VoiceL
 }
 
 func (m *mockAllStore) ListMCPServers(_ context.Context) ([]MCPServerRecord, error) { return nil, nil }
-func (m *mockAllStore) GetMCPServer(_ context.Context, _ string) (*MCPServerRecord, error) { return nil, ErrNotFound }
-func (m *mockAllStore) UpsertMCPServer(_ context.Context, rec *MCPServerRecord) (*MCPServerRecord, error) { return rec, nil }
+func (m *mockAllStore) GetMCPServer(_ context.Context, _ string) (*MCPServerRecord, error) {
+	return nil, ErrNotFound
+}
+func (m *mockAllStore) UpsertMCPServer(_ context.Context, rec *MCPServerRecord) (*MCPServerRecord, error) {
+	return rec, nil
+}
 func (m *mockAllStore) DeleteMCPServer(_ context.Context, _ string) error { return nil }
 func (m *mockAllStore) ListAuditLogs(_ context.Context, _, _ int) ([]AuditLogRecord, error) {
 	m.mu.Lock()
@@ -460,5 +464,144 @@ func TestVoiceLanguagesAdminAPI(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "admin.voice_languages.update") {
 		t.Fatalf("expected audit log entry for voice_languages, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminProviderDiscoveryAPIs(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/audio/voices":
+			_, _ = w.Write([]byte(`{"voices":["af_heart","zf_xiaoxiao"]}`))
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"other-model"},{"id":"openai/whisper-large"},{"id":"Systran/faster-whisper-small"},{"id":"Systran/faster-whisper-medium"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+
+	store := newMockAllStore()
+	store.agentCfg.TTSBaseURL = provider.URL + "/v1"
+	store.agentCfg.STTBaseURL = provider.URL + "/v1"
+	vault, err := security.NewVault(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authSvc := auth.NewService(store, auth.Config{
+		WebOrigin:           "https://aegis.local",
+		AdminBootstrapToken: "boot-123",
+	}, nil)
+	rtcMgr, err := rtc.NewManager(rtc.Config{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rtcMgr.Close()
+
+	router := NewServer(authSvc, store, store, rag.NewService(nil, 0), rtcMgr, mcp.NewHost(false), vault, true, nil).Router()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/bootstrap", bytes.NewBufferString(`{"bootstrapToken":"boot-123","email":"admin@aegis.local","password":"AdminPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("bootstrap failed: %d %s", rec.Code, rec.Body.String())
+	}
+	adminCookie := rec.Result().Cookies()[0]
+	var bootstrap struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+
+	getAdmin := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(adminCookie)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	var voicesResponse struct {
+		Voices    []string `json:"voices"`
+		Supported bool     `json:"supported"`
+	}
+	rec = getAdmin("/api/v1/admin/tts-voices")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET tts-voices failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &voicesResponse); err != nil {
+		t.Fatal(err)
+	}
+	if !voicesResponse.Supported || strings.Join(voicesResponse.Voices, ",") != "af_heart,zf_xiaoxiao" {
+		t.Fatalf("unexpected TTS voices response: %+v", voicesResponse)
+	}
+
+	var modelsResponse struct {
+		Models    []string `json:"models"`
+		Supported bool     `json:"supported"`
+	}
+	rec = getAdmin("/api/v1/admin/stt-models")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET stt-models failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &modelsResponse); err != nil {
+		t.Fatal(err)
+	}
+	wantModels := []string{
+		"Systran/faster-whisper-small",
+		"Systran/faster-whisper-medium",
+		"openai/whisper-large",
+		"other-model",
+	}
+	if !modelsResponse.Supported || strings.Join(modelsResponse.Models, ",") != strings.Join(wantModels, ",") {
+		t.Fatalf("unexpected prioritized STT models: %+v", modelsResponse)
+	}
+
+	for _, baseURL := range []string{provider.URL + "/missing/v1", "http://127.0.0.1:1/v1"} {
+		store.mu.Lock()
+		store.agentCfg.TTSBaseURL = baseURL
+		store.mu.Unlock()
+		rec = getAdmin("/api/v1/admin/tts-voices")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unsupported provider should return 200, got %d %s", rec.Code, rec.Body.String())
+		}
+		voicesResponse = struct {
+			Voices    []string `json:"voices"`
+			Supported bool     `json:"supported"`
+		}{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &voicesResponse); err != nil {
+			t.Fatal(err)
+		}
+		if voicesResponse.Supported || len(voicesResponse.Voices) != 0 {
+			t.Fatalf("expected unsupported response for %q, got %+v", baseURL, voicesResponse)
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026","role":"user"}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootstrap.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create user failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("user login failed: %d %s", rec.Code, rec.Body.String())
+	}
+	userCookie := rec.Result().Cookies()[0]
+	for _, path := range []string{"/api/v1/admin/tts-voices", "/api/v1/admin/stt-models"} {
+		req = httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(userCookie)
+		rec = httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for non-admin on %s, got %d %s", path, rec.Code, rec.Body.String())
+		}
 	}
 }

@@ -23,6 +23,8 @@ import {
   addLanguage,
   availableCatalogLanguages,
   canRemoveLanguage,
+  includeSavedOption,
+  partitionVoicesByLanguage,
   removeLanguage,
   type VoiceLanguageSettings,
 } from "@/lib/voice-languages";
@@ -58,6 +60,16 @@ interface AgentConfig {
   apiKeyPreview: string;
   ragTopK: number;
   ragMinSimilarity: number;
+}
+
+interface TTSVoiceDiscovery {
+  voices: string[];
+  supported: boolean;
+}
+
+interface STTModelDiscovery {
+  models: string[];
+  supported: boolean;
 }
 
 interface MCPServer {
@@ -121,6 +133,14 @@ export default function AdminPage() {
   });
   const [newApiKey, setNewApiKey] = useState("");
   const [testingConn, setTestingConn] = useState(false);
+  const [ttsVoiceDiscovery, setTTSVoiceDiscovery] = useState<TTSVoiceDiscovery>({
+    voices: [],
+    supported: false,
+  });
+  const [sttModelDiscovery, setSTTModelDiscovery] = useState<STTModelDiscovery>({
+    models: [],
+    supported: false,
+  });
 
   // Voice languages state
   const [voiceLangs, setVoiceLangs] = useState<VoiceLanguageSettings>({
@@ -159,13 +179,15 @@ export default function AdminPage() {
 
   async function loadAll() {
     try {
-      const [uRes, dRes, cRes, vlRes, mRes, aRes] = await Promise.all([
+      const [uRes, dRes, cRes, vlRes, mRes, aRes, voicesRes, modelsRes] = await Promise.all([
         apiFetch<{ users: AuthUser[] }>("/api/v1/admin/users"),
         apiFetch<{ documents: DocRecord[] }>("/api/v1/admin/documents"),
         apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config"),
         apiFetch<VoiceLanguageSettings>("/api/v1/admin/voice-languages"),
         apiFetch<{ servers: MCPServer[] }>("/api/v1/admin/mcp-servers"),
         apiFetch<{ logs: AuditLog[] }>("/api/v1/admin/audit-logs"),
+        apiFetch<TTSVoiceDiscovery>("/api/v1/admin/tts-voices"),
+        apiFetch<STTModelDiscovery>("/api/v1/admin/stt-models"),
       ]);
       setUsers(uRes.users || []);
       setDocs(dRes.documents || []);
@@ -177,6 +199,8 @@ export default function AdminPage() {
       }
       setMcpServers(mRes.servers || []);
       setLogs(aRes.logs || []);
+      setTTSVoiceDiscovery(voicesRes);
+      setSTTModelDiscovery(modelsRes);
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to load admin data" });
     }
@@ -282,6 +306,21 @@ export default function AdminPage() {
       setCfg(res.config);
       setNewApiKey("");
       setNotice({ type: "ok", text: "AI Agent configuration saved and encrypted." });
+      try {
+        const [voicesRes, modelsRes] = await Promise.all([
+          apiFetch<TTSVoiceDiscovery>("/api/v1/admin/tts-voices"),
+          apiFetch<STTModelDiscovery>("/api/v1/admin/stt-models"),
+        ]);
+        setTTSVoiceDiscovery(voicesRes);
+        setSTTModelDiscovery(modelsRes);
+      } catch (err) {
+        setNotice({
+          type: "err",
+          text: `Configuration saved, but provider options could not be refreshed: ${
+            err instanceof Error ? err.message : "request failed"
+          }`,
+        });
+      }
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Save failed" });
     }
@@ -414,6 +453,7 @@ export default function AdminPage() {
     { id: "mcp", label: "MCP Servers", icon: Plug },
     { id: "audit", label: "Audit Logs", icon: ShieldAlert },
   ];
+  const sttModelOptions = includeSavedOption(sttModelDiscovery.models, cfg.sttModel);
 
   return (
     <div className="min-h-screen bg-[#05070F] text-slate-100">
@@ -740,6 +780,30 @@ export default function AdminPage() {
                     />
                   </div>
                   <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">STT Model</label>
+                    {sttModelDiscovery.supported && sttModelDiscovery.models.length > 0 ? (
+                      <select
+                        value={cfg.sttModel}
+                        onChange={(e) => setCfg({ ...cfg, sttModel: e.target.value })}
+                        className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                      >
+                        {sttModelOptions.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="text"
+                        value={cfg.sttModel}
+                        onChange={(e) => setCfg({ ...cfg, sttModel: e.target.value })}
+                        placeholder="whisper-1"
+                        className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                      />
+                    )}
+                  </div>
+                  <div>
                     <label className="mb-1 block text-xs uppercase text-slate-400">TTS Base URL</label>
                     <input
                       type="url"
@@ -814,6 +878,13 @@ export default function AdminPage() {
               {voiceLangs.languages.map((lang) => {
                 const isDefault = lang.code === voiceLangs.defaultLanguage;
                 const removable = canRemoveLanguage(lang.code, voiceLangs.defaultLanguage);
+                const voiceGroups = partitionVoicesByLanguage(ttsVoiceDiscovery.voices, lang.code);
+                const listedVoices = includeSavedOption(
+                  [...voiceGroups.recommended, ...voiceGroups.others],
+                  lang.voice
+                );
+                const hasUnlistedSavedVoice =
+                  lang.voice !== "" && !ttsVoiceDiscovery.voices.includes(lang.voice);
                 return (
                   <div
                     key={lang.code}
@@ -827,22 +898,66 @@ export default function AdminPage() {
                     </div>
 
                     <div className="flex-1 min-w-[180px]">
-                      <input
-                        type="text"
-                        value={lang.voice}
-                        onChange={(e) => {
-                          const v = e.target.value;
-                          setVoiceLangs((prev) => ({
-                            ...prev,
-                            languages: prev.languages.map((item) =>
-                              item.code === lang.code ? { ...item, voice: v } : item
-                            ),
-                          }));
-                        }}
-                        placeholder="Voice name (e.g. af_heart, zf_xiaoxiao)"
-                        aria-label={`Voice for ${lang.name}`}
-                        className="w-full rounded-lg border border-slate-700/60 bg-slate-900 px-2.5 py-1.5 text-sm text-white"
-                      />
+                      {ttsVoiceDiscovery.supported && ttsVoiceDiscovery.voices.length > 0 ? (
+                        <select
+                          value={lang.voice}
+                          onChange={(e) => {
+                            const voice = e.target.value;
+                            setVoiceLangs((prev) => ({
+                              ...prev,
+                              languages: prev.languages.map((item) =>
+                                item.code === lang.code ? { ...item, voice } : item
+                              ),
+                            }));
+                          }}
+                          aria-label={`Voice for ${lang.name}`}
+                          className="w-full rounded-lg border border-slate-700/60 bg-slate-900 px-2.5 py-1.5 text-sm text-white"
+                        >
+                          <option value="">None (fallback to default)</option>
+                          {hasUnlistedSavedVoice && (
+                            <option value={lang.voice}>Saved custom voice: {lang.voice}</option>
+                          )}
+                          {voiceGroups.recommended.length > 0 && (
+                            <optgroup label="Recommended">
+                              {voiceGroups.recommended.map((voice) => (
+                                <option key={voice} value={voice}>
+                                  {voice}
+                                </option>
+                              ))}
+                            </optgroup>
+                          )}
+                          <optgroup label="All voices">
+                            {listedVoices
+                              .filter(
+                                (voice) =>
+                                  !voiceGroups.recommended.includes(voice) &&
+                                  !(hasUnlistedSavedVoice && voice === lang.voice)
+                              )
+                              .map((voice) => (
+                                <option key={voice} value={voice}>
+                                  {voice}
+                                </option>
+                              ))}
+                          </optgroup>
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          value={lang.voice}
+                          onChange={(e) => {
+                            const voice = e.target.value;
+                            setVoiceLangs((prev) => ({
+                              ...prev,
+                              languages: prev.languages.map((item) =>
+                                item.code === lang.code ? { ...item, voice } : item
+                              ),
+                            }));
+                          }}
+                          placeholder="Voice name (e.g. af_heart, zf_xiaoxiao)"
+                          aria-label={`Voice for ${lang.name}`}
+                          className="w-full rounded-lg border border-slate-700/60 bg-slate-900 px-2.5 py-1.5 text-sm text-white"
+                        />
+                      )}
                       {lang.voice.trim() === "" && (
                         <p className="mt-1 text-[11px] text-amber-400/90">
                           No voice assigned — replies will be spoken in the default language.

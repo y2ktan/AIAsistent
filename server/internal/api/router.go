@@ -76,6 +76,8 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /api/v1/admin/agent-config", admin(s.HandleGetAgentConfig))
 	mux.Handle("PUT /api/v1/admin/agent-config", admin(s.HandleUpdateAgentConfig))
 	mux.Handle("POST /api/v1/admin/agent-config/test", admin(s.HandleTestAgentConfig))
+	mux.Handle("GET /api/v1/admin/tts-voices", admin(s.HandleDiscoverTTSVoices))
+	mux.Handle("GET /api/v1/admin/stt-models", admin(s.HandleDiscoverSTTModels))
 	mux.Handle("GET /api/v1/admin/voice-languages", admin(s.HandleGetVoiceLanguages))
 	mux.Handle("PUT /api/v1/admin/voice-languages", admin(s.HandleUpdateVoiceLanguages))
 

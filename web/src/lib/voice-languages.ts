@@ -17,6 +17,44 @@ export interface VoiceLanguageSettings {
   catalog: LanguageCatalogItem[];
 }
 
+const KOKORO_PREFIXES: Record<string, string[]> = {
+  en: ["a", "b"],
+  es: ["e"],
+  fr: ["f"],
+  hi: ["h"],
+  it: ["i"],
+  ja: ["j"],
+  pt: ["p"],
+  zh: ["z"],
+};
+
+export function partitionVoicesByLanguage(
+  voices: string[],
+  languageCode: string
+): { recommended: string[]; others: string[] } {
+  const language = languageCode.toLowerCase().split("-")[0];
+  const prefixes = KOKORO_PREFIXES[language] || [];
+  const recommended: string[] = [];
+  const others: string[] = [];
+
+  for (const voice of voices) {
+    if (prefixes.some((prefix) => voice.toLowerCase().startsWith(prefix))) {
+      recommended.push(voice);
+    } else {
+      others.push(voice);
+    }
+  }
+
+  return { recommended, others };
+}
+
+export function includeSavedOption(options: string[], savedValue: string): string[] {
+  if (!savedValue || options.includes(savedValue)) {
+    return options;
+  }
+  return [...options, savedValue];
+}
+
 export function canRemoveLanguage(code: string, defaultLanguage: string): boolean {
   return code !== defaultLanguage;
 }

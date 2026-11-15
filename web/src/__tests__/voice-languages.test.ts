@@ -3,6 +3,8 @@ import {
   addLanguage,
   availableCatalogLanguages,
   canRemoveLanguage,
+  includeSavedOption,
+  partitionVoicesByLanguage,
   removeLanguage,
   type LanguageCatalogItem,
   type VoiceLanguage,
@@ -37,5 +39,32 @@ describe("voice-languages helpers", () => {
 
     expect(removeLanguage(list, "en", "en")).toEqual(list);
     expect(removeLanguage(list, "en", "zh").map((l) => l.code)).toEqual(["en"]);
+  });
+
+  it("partitions Kokoro voices by the language-specific recommendation prefixes", () => {
+    const voices = ["af_heart", "bf_emma", "zf_xiaoxiao", "jf_alpha", "ef_dora"];
+
+    expect(partitionVoicesByLanguage(voices, "zh")).toEqual({
+      recommended: ["zf_xiaoxiao"],
+      others: ["af_heart", "bf_emma", "jf_alpha", "ef_dora"],
+    });
+    expect(partitionVoicesByLanguage(voices, "en")).toEqual({
+      recommended: ["af_heart", "bf_emma"],
+      others: ["zf_xiaoxiao", "jf_alpha", "ef_dora"],
+    });
+    expect(partitionVoicesByLanguage(voices, "yue").recommended).toEqual([]);
+    expect(partitionVoicesByLanguage(voices, "ms").recommended).toEqual([]);
+  });
+
+  it("preserves previously saved custom values in selector options", () => {
+    expect(includeSavedOption(["af_heart"], "custom_voice")).toEqual([
+      "af_heart",
+      "custom_voice",
+    ]);
+    expect(includeSavedOption(["Systran/faster-whisper-small"], "custom-model")).toEqual([
+      "Systran/faster-whisper-small",
+      "custom-model",
+    ]);
+    expect(includeSavedOption(["af_heart"], "af_heart")).toEqual(["af_heart"]);
   });
 });
