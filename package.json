@@ -1,0 +1,15 @@
+{
+  "name": "aiasistent",
+  "version": "1.0.0",
+  "description": "Local AI chat with document retrieval and MCP tools",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "license": "UNLICENSED"
+}

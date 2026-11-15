@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIAsistent</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><h1>AIAsistent</h1><p>Chat with AI, your documents, and MCP tools.</p></header>
+    <p id="status" role="status">Loading configuration…</p>
+    <section aria-labelledby="documents-heading">
+      <h2 id="documents-heading">Documents</h2>
+      <label>Add text or Markdown (1 MiB each, up to 20)
+        <input id="upload" type="file" accept=".txt,.md" multiple>
+      </label>
+      <ul id="documents"></ul>
+      <p>Documents stay in server memory until removed or the server restarts.</p>
+    </section>
+    <section aria-labelledby="chat-heading">
+      <h2 id="chat-heading">Chat</h2>
+      <label><input id="tools" type="checkbox"> Allow configured MCP tools for this message</label>
+      <p id="tool-info">Tools are off by default. Enable only tools you trust.</p>
+      <div id="messages" role="log" aria-live="polite"></div>
+      <form id="chat-form">
+        <label for="prompt">Your message</label>
+        <textarea id="prompt" rows="3" maxlength="8000" required></textarea>
+        <div class="actions"><button id="send" type="submit">Send</button>
+          <button id="clear" type="button">New chat</button></div>
+      </form>
+    </section>
+    <p id="error" role="alert"></p>
+  </main>
+</body>
+</html>
