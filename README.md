@@ -64,3 +64,10 @@ Configure supported spoken languages in **`/admin` → AI Agent → Voice langua
 - **Per-language voices & fallback**: In `cascaded` mode, replies are spoken using the voice assigned to the reply's language. If a user speaks an unsupported language—or a supported language with no assigned voice—the assistant answers in the default language and notifies the user once per session that it cannot reply in that language.
 - **Cantonese & Malay voices**: The bundled local Kokoro TTS engine provides English and Mandarin voices (`af_heart`, `zf_xiaoxiao`) out of the box. To speak Cantonese or Malay instead of falling back to the default language, configure a TTS engine that provides voices for them and assign those voice names in `/admin`.
 
+## Issues and solutions
+# speech transcription failed
+When seeing the error `speech transcription failed` run the command below in the terminal
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-ai.yml up -d --force-recreate stt tts
+docker compose -f docker-compose.yml -f docker-compose.local-ai.yml ps
+```
