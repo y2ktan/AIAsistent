@@ -1,0 +1,8 @@
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS mcp_servers;
+DROP TABLE IF EXISTS agent_configs;
+DROP TABLE IF EXISTS document_chunks;
+DROP TABLE IF EXISTS documents;
+DROP TABLE IF EXISTS signaling_tokens;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;

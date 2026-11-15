@@ -1,0 +1,293 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"aegis-voice/server/internal/auth"
+)
+
+type PGAdminStore struct {
+	pool *pgxpool.Pool
+}
+
+func NewPGAdminStore(pool *pgxpool.Pool) *PGAdminStore {
+	return &PGAdminStore{pool: pool}
+}
+
+func (s *PGAdminStore) ListUsers(ctx context.Context) ([]auth.User, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text, email, role, is_active, created_at, updated_at
+		FROM users ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []auth.User
+	for rows.Next() {
+		var u auth.User
+		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.IsActive, &u.CreatedAt, &u.UpdatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+func (s *PGAdminStore) CreateUser(ctx context.Context, email, passwordHash, role string) (*auth.User, error) {
+	u := &auth.User{}
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO users (email, password_hash, role, is_active)
+		VALUES ($1, $2, $3, TRUE)
+		RETURNING id::text, email, role, is_active, created_at, updated_at
+	`, email, passwordHash, role).Scan(&u.ID, &u.Email, &u.Role, &u.IsActive, &u.CreatedAt, &u.UpdatedAt)
+	return u, err
+}
+
+func (s *PGAdminStore) UpdateUser(ctx context.Context, userID, role string, isActive bool) (*auth.User, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentRole string
+	var currentActive bool
+	err = tx.QueryRow(ctx, `SELECT role, is_active FROM users WHERE id = $1::uuid`, userID).Scan(&currentRole, &currentActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if currentRole == auth.RoleAdmin && currentActive && (role != auth.RoleAdmin || !isActive) {
+		var remaining int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = TRUE AND id <> $1::uuid`, userID).Scan(&remaining); err != nil {
+			return nil, err
+		}
+		if remaining == 0 {
+			return nil, ErrLastAdmin
+		}
+	}
+
+	u := &auth.User{}
+	err = tx.QueryRow(ctx, `
+		UPDATE users SET role = $2, is_active = $3, updated_at = NOW()
+		WHERE id = $1::uuid
+		RETURNING id::text, email, role, is_active, created_at, updated_at
+	`, userID, role, isActive).Scan(&u.ID, &u.Email, &u.Role, &u.IsActive, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, error) {
+	r := &AgentConfigRecord{}
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text, name, mode, realtime_ws_url, realtime_model,
+		       stt_base_url, stt_model, llm_base_url, llm_model,
+		       tts_base_url, tts_model, tts_voice,
+		       embedding_base_url, embedding_model, embedding_dim,
+		       system_instructions, api_key_ciphertext, api_key_last4,
+		       rag_top_k, rag_min_similarity, updated_at
+		FROM agent_configs WHERE name = 'default'
+	`).Scan(
+		&r.ID, &r.Name, &r.Mode, &r.RealtimeWSURL, &r.RealtimeModel,
+		&r.STTBaseURL, &r.STTModel, &r.LLMBaseURL, &r.LLMModel,
+		&r.TTSBaseURL, &r.TTSModel, &r.TTSVoice,
+		&r.EmbeddingBaseURL, &r.EmbeddingModel, &r.EmbeddingDim,
+		&r.SystemInstructions, &r.APIKeyCiphertext, &r.APIKeyLast4,
+		&r.RAGTopK, &r.RAGMinSimilarity, &r.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &AgentConfigRecord{
+			Name:             "default",
+			Mode:             "cascaded",
+			STTModel:         "whisper-1",
+			LLMModel:         "gpt-4o",
+			TTSModel:         "tts-1",
+			TTSVoice:         "alloy",
+			EmbeddingModel:   "text-embedding-3-small",
+			EmbeddingDim:     1536,
+			RAGTopK:          5,
+			RAGMinSimilarity: 0.35,
+		}, nil
+	}
+	return r, err
+}
+
+func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRecord) error {
+	return s.pool.QueryRow(ctx, `
+		INSERT INTO agent_configs (
+			name, mode, realtime_ws_url, realtime_model,
+			stt_base_url, stt_model, llm_base_url, llm_model,
+			tts_base_url, tts_model, tts_voice,
+			embedding_base_url, embedding_model, embedding_dim,
+			system_instructions, api_key_ciphertext, api_key_last4,
+			rag_top_k, rag_min_similarity, updated_at
+		) VALUES (
+			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW()
+		)
+		ON CONFLICT (name) DO UPDATE SET
+			mode = EXCLUDED.mode,
+			realtime_ws_url = EXCLUDED.realtime_ws_url,
+			realtime_model = EXCLUDED.realtime_model,
+			stt_base_url = EXCLUDED.stt_base_url,
+			stt_model = EXCLUDED.stt_model,
+			llm_base_url = EXCLUDED.llm_base_url,
+			llm_model = EXCLUDED.llm_model,
+			tts_base_url = EXCLUDED.tts_base_url,
+			tts_model = EXCLUDED.tts_model,
+			tts_voice = EXCLUDED.tts_voice,
+			embedding_base_url = EXCLUDED.embedding_base_url,
+			embedding_model = EXCLUDED.embedding_model,
+			embedding_dim = EXCLUDED.embedding_dim,
+			system_instructions = EXCLUDED.system_instructions,
+			api_key_ciphertext = COALESCE(EXCLUDED.api_key_ciphertext, agent_configs.api_key_ciphertext),
+			api_key_last4 = CASE WHEN EXCLUDED.api_key_last4 <> '' THEN EXCLUDED.api_key_last4 ELSE agent_configs.api_key_last4 END,
+			rag_top_k = EXCLUDED.rag_top_k,
+			rag_min_similarity = EXCLUDED.rag_min_similarity,
+			updated_at = NOW()
+		RETURNING id::text, updated_at
+	`,
+		rec.Mode, rec.RealtimeWSURL, rec.RealtimeModel,
+		rec.STTBaseURL, rec.STTModel, rec.LLMBaseURL, rec.LLMModel,
+		rec.TTSBaseURL, rec.TTSModel, rec.TTSVoice,
+		rec.EmbeddingBaseURL, rec.EmbeddingModel, rec.EmbeddingDim,
+		rec.SystemInstructions, rec.APIKeyCiphertext, rec.APIKeyLast4,
+		rec.RAGTopK, rec.RAGMinSimilarity,
+	).Scan(&rec.ID, &rec.UpdatedAt)
+}
+
+func (s *PGAdminStore) ListMCPServers(ctx context.Context) ([]MCPServerRecord, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text, name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4,
+		       enabled, allowed_tools, discovered_tools, timeout_ms, created_at, updated_at
+		FROM mcp_servers ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []MCPServerRecord
+	for rows.Next() {
+		var m MCPServerRecord
+		var toolsJSON []byte
+		if err := rows.Scan(
+			&m.ID, &m.Name, &m.Transport, &m.EndpointURL, &m.AuthHeaderCiphertext, &m.AuthHeaderLast4,
+			&m.Enabled, &m.AllowedTools, &toolsJSON, &m.TimeoutMs, &m.CreatedAt, &m.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(toolsJSON, &m.DiscoveredTools)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGAdminStore) GetMCPServer(ctx context.Context, id string) (*MCPServerRecord, error) {
+	var m MCPServerRecord
+	var toolsJSON []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text, name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4,
+		       enabled, allowed_tools, discovered_tools, timeout_ms, created_at, updated_at
+		FROM mcp_servers WHERE id = $1::uuid
+	`, id).Scan(
+		&m.ID, &m.Name, &m.Transport, &m.EndpointURL, &m.AuthHeaderCiphertext, &m.AuthHeaderLast4,
+		&m.Enabled, &m.AllowedTools, &toolsJSON, &m.TimeoutMs, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(toolsJSON, &m.DiscoveredTools)
+	return &m, nil
+}
+
+func (s *PGAdminStore) UpsertMCPServer(ctx context.Context, rec *MCPServerRecord) (*MCPServerRecord, error) {
+	toolsJSON, _ := json.Marshal(rec.DiscoveredTools)
+	if len(toolsJSON) == 0 {
+		toolsJSON = []byte("[]")
+	}
+	if rec.AllowedTools == nil {
+		rec.AllowedTools = []string{}
+	}
+	if rec.ID == "" {
+		err := s.pool.QueryRow(ctx, `
+			INSERT INTO mcp_servers (name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4, enabled, allowed_tools, discovered_tools, timeout_ms)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+			RETURNING id::text, created_at, updated_at
+		`, rec.Name, rec.Transport, rec.EndpointURL, rec.AuthHeaderCiphertext, rec.AuthHeaderLast4, rec.Enabled, rec.AllowedTools, string(toolsJSON), rec.TimeoutMs).
+			Scan(&rec.ID, &rec.CreatedAt, &rec.UpdatedAt)
+		return rec, err
+	}
+
+	err := s.pool.QueryRow(ctx, `
+		UPDATE mcp_servers SET
+			name = $2, transport = $3, endpoint_url = $4,
+			auth_header_ciphertext = COALESCE($5, auth_header_ciphertext),
+			auth_header_last4 = CASE WHEN $6 <> '' THEN $6 ELSE auth_header_last4 END,
+			enabled = $7, allowed_tools = $8, discovered_tools = $9::jsonb, timeout_ms = $10, updated_at = NOW()
+		WHERE id = $1::uuid
+		RETURNING created_at, updated_at
+	`, rec.ID, rec.Name, rec.Transport, rec.EndpointURL, rec.AuthHeaderCiphertext, rec.AuthHeaderLast4, rec.Enabled, rec.AllowedTools, string(toolsJSON), rec.TimeoutMs).
+		Scan(&rec.CreatedAt, &rec.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return rec, err
+}
+
+func (s *PGAdminStore) DeleteMCPServer(ctx context.Context, id string) error {
+	ct, err := s.pool.Exec(ctx, `DELETE FROM mcp_servers WHERE id = $1::uuid`, id)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PGAdminStore) ListAuditLogs(ctx context.Context, limit, offset int) ([]AuditLogRecord, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, actor_id::text, actor_email, action, target_type, target_id, ip_address, outcome, metadata, created_at
+		FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AuditLogRecord
+	for rows.Next() {
+		var r AuditLogRecord
+		var metaBytes []byte
+		if err := rows.Scan(&r.ID, &r.ActorID, &r.ActorEmail, &r.Action, &r.TargetType, &r.TargetID, &r.IPAddress, &r.Outcome, &metaBytes, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(metaBytes, &r.Metadata)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

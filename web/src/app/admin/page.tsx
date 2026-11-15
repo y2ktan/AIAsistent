@@ -1,0 +1,901 @@
+"use client";
+
+import { useEffect, useState, FormEvent, DragEvent } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  Users,
+  FileText,
+  Bot,
+  Plug,
+  ShieldAlert,
+  ArrowLeft,
+  LogOut,
+  Upload,
+  Trash2,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  RefreshCw,
+} from "lucide-react";
+import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
+
+type Tab = "users" | "rag" | "agent" | "mcp" | "audit";
+
+interface DocRecord {
+  id: string;
+  title: string;
+  filename: string;
+  sizeBytes: number;
+  status: "processing" | "ready" | "failed";
+  errorMessage?: string;
+  chunkCount: number;
+  createdAt: string;
+}
+
+interface AgentConfig {
+  mode: "cascaded" | "realtime";
+  realtimeWsUrl: string;
+  realtimeModel: string;
+  sttBaseUrl: string;
+  sttModel: string;
+  llmBaseUrl: string;
+  llmModel: string;
+  ttsBaseUrl: string;
+  ttsModel: string;
+  ttsVoice: string;
+  embeddingBaseUrl: string;
+  embeddingModel: string;
+  embeddingDim: number;
+  systemInstructions: string;
+  apiKeyPreview: string;
+  ragTopK: number;
+  ragMinSimilarity: number;
+}
+
+interface MCPServer {
+  id: string;
+  name: string;
+  transport: "streamable_http" | "sse";
+  endpointUrl: string;
+  authHeaderPreview: string;
+  enabled: boolean;
+  allowedTools: string[];
+  discoveredTools: { name: string; description?: string }[];
+  timeoutMs: number;
+}
+
+interface AuditLog {
+  id: number;
+  actorEmail: string;
+  action: string;
+  targetType: string;
+  targetId: string;
+  ipAddress: string;
+  outcome: string;
+  createdAt: string;
+}
+
+export default function AdminPage() {
+  const router = useRouter();
+  const [tab, setTab] = useState<Tab>("users");
+  const [me, setMe] = useState<AuthUser | null>(null);
+  const [notice, setNotice] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  // Users state
+  const [users, setUsers] = useState<AuthUser[]>([]);
+  const [newEmail, setNewEmail] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newRole, setNewRole] = useState<"user" | "admin">("user");
+
+  // RAG state
+  const [docs, setDocs] = useState<DocRecord[]>([]);
+  const [uploading, setUploading] = useState(false);
+
+  // Agent config state
+  const [cfg, setCfg] = useState<AgentConfig>({
+    mode: "cascaded",
+    realtimeWsUrl: "",
+    realtimeModel: "",
+    sttBaseUrl: "",
+    sttModel: "whisper-1",
+    llmBaseUrl: "",
+    llmModel: "gpt-4o",
+    ttsBaseUrl: "",
+    ttsModel: "tts-1",
+    ttsVoice: "alloy",
+    embeddingBaseUrl: "",
+    embeddingModel: "text-embedding-3-small",
+    embeddingDim: 1536,
+    systemInstructions: "",
+    apiKeyPreview: "",
+    ragTopK: 5,
+    ragMinSimilarity: 0.35,
+  });
+  const [newApiKey, setNewApiKey] = useState("");
+  const [testingConn, setTestingConn] = useState(false);
+
+  // MCP state
+  const [mcpServers, setMcpServers] = useState<MCPServer[]>([]);
+  const [mcpName, setMcpName] = useState("");
+  const [mcpUrl, setMcpUrl] = useState("");
+  const [mcpAuth, setMcpAuth] = useState("");
+  const [mcpTransport, setMcpTransport] = useState<"streamable_http" | "sse">("streamable_http");
+
+  // Audit state
+  const [logs, setLogs] = useState<AuditLog[]>([]);
+
+  useEffect(() => {
+    fetchSession().then((res) => {
+      if (!res) {
+        router.push("/login");
+        return;
+      }
+      if (res.user.role !== "admin") {
+        router.push("/");
+        return;
+      }
+      setMe(res.user);
+      loadAll();
+    });
+  }, [router]);
+
+  async function loadAll() {
+    try {
+      const [uRes, dRes, cRes, mRes, aRes] = await Promise.all([
+        apiFetch<{ users: AuthUser[] }>("/api/v1/admin/users"),
+        apiFetch<{ documents: DocRecord[] }>("/api/v1/admin/documents"),
+        apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config"),
+        apiFetch<{ servers: MCPServer[] }>("/api/v1/admin/mcp-servers"),
+        apiFetch<{ logs: AuditLog[] }>("/api/v1/admin/audit-logs"),
+      ]);
+      setUsers(uRes.users || []);
+      setDocs(dRes.documents || []);
+      if (cRes.config) setCfg(cRes.config);
+      setMcpServers(mRes.servers || []);
+      setLogs(aRes.logs || []);
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to load admin data" });
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await apiFetch("/api/v1/auth/logout", { method: "POST" });
+    } finally {
+      router.push("/login");
+    }
+  }
+
+  async function handleCreateUser(e: FormEvent) {
+    e.preventDefault();
+    setNotice(null);
+    try {
+      await apiFetch("/api/v1/admin/users", {
+        method: "POST",
+        body: JSON.stringify({ email: newEmail, password: newPassword, role: newRole }),
+      });
+      setNewEmail("");
+      setNewPassword("");
+      setNotice({ type: "ok", text: "User account created." });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Create user failed" });
+    }
+  }
+
+  async function handleToggleUser(u: AuthUser, role: "user" | "admin", isActive: boolean) {
+    setNotice(null);
+    try {
+      await apiFetch(`/api/v1/admin/users/${u.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ role, isActive }),
+      });
+      setNotice({ type: "ok", text: `Updated ${u.email}.` });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Update failed" });
+    }
+  }
+
+  async function uploadFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    setUploading(true);
+    setNotice(null);
+    try {
+      for (const file of Array.from(files)) {
+        const fd = new FormData();
+        fd.append("file", file);
+        fd.append("title", file.name);
+        await apiFetch("/api/v1/admin/documents", { method: "POST", body: fd });
+      }
+      setNotice({ type: "ok", text: "Document(s) uploaded and indexed." });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Upload failed" });
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handleDeleteDoc(id: string) {
+    setNotice(null);
+    try {
+      await apiFetch(`/api/v1/admin/documents/${id}`, { method: "DELETE" });
+      setNotice({ type: "ok", text: "Document deleted." });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Delete failed" });
+    }
+  }
+
+  async function handleSaveConfig(e: FormEvent) {
+    e.preventDefault();
+    setNotice(null);
+    try {
+      const payload = {
+        mode: cfg.mode,
+        realtimeWsUrl: cfg.realtimeWsUrl,
+        realtimeModel: cfg.realtimeModel,
+        sttBaseUrl: cfg.sttBaseUrl,
+        sttModel: cfg.sttModel,
+        llmBaseUrl: cfg.llmBaseUrl,
+        llmModel: cfg.llmModel,
+        ttsBaseUrl: cfg.ttsBaseUrl,
+        ttsModel: cfg.ttsModel,
+        ttsVoice: cfg.ttsVoice,
+        embeddingBaseUrl: cfg.embeddingBaseUrl,
+        embeddingModel: cfg.embeddingModel,
+        embeddingDim: Number(cfg.embeddingDim) || 1536,
+        systemInstructions: cfg.systemInstructions,
+        apiKey: newApiKey,
+        ragTopK: Number(cfg.ragTopK) || 5,
+        ragMinSimilarity: Number(cfg.ragMinSimilarity) || 0.35,
+      };
+      const res = await apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      setCfg(res.config);
+      setNewApiKey("");
+      setNotice({ type: "ok", text: "AI Agent configuration saved and encrypted." });
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Save failed" });
+    }
+  }
+
+  async function handleTestConnection() {
+    setTestingConn(true);
+    setNotice(null);
+    try {
+      const res = await apiFetch<{ ok: boolean; message?: string; statusCode?: number }>(
+        "/api/v1/admin/agent-config/test",
+        { method: "POST" }
+      );
+      setNotice({
+        type: res.ok ? "ok" : "err",
+        text: res.ok
+          ? `Connection verified (status ${res.statusCode ?? 200}).`
+          : res.message || "Connection check failed.",
+      });
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Connection test failed" });
+    } finally {
+      setTestingConn(false);
+    }
+  }
+
+  async function handleAddMCP(e: FormEvent) {
+    e.preventDefault();
+    setNotice(null);
+    try {
+      await apiFetch("/api/v1/admin/mcp-servers", {
+        method: "POST",
+        body: JSON.stringify({
+          name: mcpName,
+          transport: mcpTransport,
+          endpointUrl: mcpUrl,
+          authHeader: mcpAuth,
+          enabled: true,
+          allowedTools: [],
+          timeoutMs: 10000,
+        }),
+      });
+      setMcpName("");
+      setMcpUrl("");
+      setMcpAuth("");
+      setNotice({ type: "ok", text: "MCP server registered." });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to register MCP server" });
+    }
+  }
+
+  async function handleDiscoverMCP(id: string) {
+    setNotice(null);
+    try {
+      await apiFetch(`/api/v1/admin/mcp-servers/${id}/discover`, { method: "POST" });
+      setNotice({ type: "ok", text: "Discovered MCP tools." });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "MCP discovery failed" });
+    }
+  }
+
+  async function handleToggleMCPTool(srv: MCPServer, toolName: string) {
+    const exists = srv.allowedTools?.includes(toolName);
+    const updated = exists
+      ? srv.allowedTools.filter((t) => t !== toolName)
+      : [...(srv.allowedTools || []), toolName];
+    try {
+      await apiFetch(`/api/v1/admin/mcp-servers/${srv.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: srv.name,
+          transport: srv.transport,
+          endpointUrl: srv.endpointUrl,
+          enabled: srv.enabled,
+          allowedTools: updated,
+          timeoutMs: srv.timeoutMs,
+        }),
+      });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to update tool allowlist" });
+    }
+  }
+
+  async function handleDeleteMCP(id: string) {
+    try {
+      await apiFetch(`/api/v1/admin/mcp-servers/${id}`, { method: "DELETE" });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to delete MCP server" });
+    }
+  }
+
+  if (!me) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#05070F] text-slate-400">
+        <Loader2 className="h-6 w-6 animate-spin" />
+      </main>
+    );
+  }
+
+  const tabs: { id: Tab; label: string; icon: typeof Users }[] = [
+    { id: "users", label: "Users & Roles", icon: Users },
+    { id: "rag", label: "RAG Knowledge", icon: FileText },
+    { id: "agent", label: "AI Agent", icon: Bot },
+    { id: "mcp", label: "MCP Servers", icon: Plug },
+    { id: "audit", label: "Audit Logs", icon: ShieldAlert },
+  ];
+
+  return (
+    <div className="min-h-screen bg-[#05070F] text-slate-100">
+      <header className="border-b border-slate-800/80 bg-slate-950/70 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+          <div className="flex items-center gap-4">
+            <Link
+              href="/"
+              className="flex items-center gap-1.5 rounded-lg border border-slate-700/60 bg-slate-900/70 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-cyan-500/40 hover:text-white"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Assistant
+            </Link>
+            <div>
+              <h1 className="text-lg font-semibold text-white">Governance Console</h1>
+              <p className="text-xs text-slate-400">{me.email} • Administrator</p>
+            </div>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="flex items-center gap-1.5 rounded-lg border border-slate-700/60 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Sign Out
+          </button>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-6xl px-6 py-8">
+        <nav className="mb-6 flex flex-wrap gap-2">
+          {tabs.map((t) => {
+            const Icon = t.icon;
+            const active = tab === t.id;
+            return (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition ${
+                  active
+                    ? "border border-cyan-400/40 bg-cyan-500/15 text-cyan-200"
+                    : "border border-slate-800 bg-slate-900/50 text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                <Icon className="h-4 w-4" />
+                {t.label}
+              </button>
+            );
+          })}
+        </nav>
+
+        {notice && (
+          <div
+            className={`mb-6 flex items-center gap-2.5 rounded-xl border px-4 py-3 text-sm ${
+              notice.type === "ok"
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                : "border-rose-500/30 bg-rose-500/10 text-rose-200"
+            }`}
+          >
+            {notice.type === "ok" ? (
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+            ) : (
+              <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
+            )}
+            <span>{notice.text}</span>
+          </div>
+        )}
+
+        {tab === "users" && (
+          <div className="space-y-6">
+            <form
+              onSubmit={handleCreateUser}
+              className="grid gap-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 md:grid-cols-4"
+            >
+              <input
+                type="email"
+                required
+                value={newEmail}
+                onChange={(e) => setNewEmail(e.target.value)}
+                placeholder="user@organization.com"
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              />
+              <input
+                type="password"
+                required
+                minLength={12}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="Password (min 12 chars)"
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              />
+              <select
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value as "user" | "admin")}
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              >
+                <option value="user">User</option>
+                <option value="admin">Admin</option>
+              </select>
+              <button
+                type="submit"
+                className="rounded-xl bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500"
+              >
+                Add User
+              </button>
+            </form>
+
+            <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/40">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-slate-800 bg-slate-950/60 text-xs uppercase text-slate-400">
+                  <tr>
+                    <th className="px-4 py-3">Email</th>
+                    <th className="px-4 py-3">Role</th>
+                    <th className="px-4 py-3">Status</th>
+                    <th className="px-4 py-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {users.map((u) => (
+                    <tr key={u.id}>
+                      <td className="px-4 py-3 font-medium text-white">{u.email}</td>
+                      <td className="px-4 py-3">
+                        <select
+                          value={u.role}
+                          onChange={(e) =>
+                            handleToggleUser(u, e.target.value as "user" | "admin", u.isActive)
+                          }
+                          className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs"
+                        >
+                          <option value="user">user</option>
+                          <option value="admin">admin</option>
+                        </select>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`rounded-full px-2.5 py-0.5 text-xs ${
+                            u.isActive
+                              ? "bg-emerald-500/15 text-emerald-300"
+                              : "bg-rose-500/15 text-rose-300"
+                          }`}
+                        >
+                          {u.isActive ? "Active" : "Disabled"}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          onClick={() => handleToggleUser(u, u.role, !u.isActive)}
+                          className="rounded-lg border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800"
+                        >
+                          {u.isActive ? "Deactivate" : "Activate"}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {tab === "rag" && (
+          <div className="space-y-6">
+            <label
+              onDragOver={(e: DragEvent) => e.preventDefault()}
+              onDrop={(e: DragEvent) => {
+                e.preventDefault();
+                uploadFiles(e.dataTransfer.files);
+              }}
+              className="flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-slate-700/70 bg-slate-900/40 p-8 text-center transition hover:border-cyan-400/50"
+            >
+              <Upload className="mb-2 h-7 w-7 text-cyan-400" />
+              <p className="text-sm font-medium text-white">
+                {uploading ? "Uploading & Indexing..." : "Drop PDF, DOCX, Markdown, or TXT files here"}
+              </p>
+              <p className="mt-1 text-xs text-slate-400">Max 20 MB per file • Magic-byte validated</p>
+              <input
+                type="file"
+                multiple
+                accept=".pdf,.docx,.md,.markdown,.txt"
+                onChange={(e) => uploadFiles(e.target.files)}
+                className="hidden"
+              />
+            </label>
+
+            <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/40">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-slate-800 bg-slate-950/60 text-xs uppercase text-slate-400">
+                  <tr>
+                    <th className="px-4 py-3">Document</th>
+                    <th className="px-4 py-3">Status</th>
+                    <th className="px-4 py-3">Chunks</th>
+                    <th className="px-4 py-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {docs.map((d) => (
+                    <tr key={d.id}>
+                      <td className="px-4 py-3">
+                        <div className="font-medium text-white">{d.title}</div>
+                        <div className="text-xs text-slate-400">{d.filename}</div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`rounded-full px-2.5 py-0.5 text-xs ${
+                            d.status === "ready"
+                              ? "bg-emerald-500/15 text-emerald-300"
+                              : d.status === "failed"
+                              ? "bg-rose-500/15 text-rose-300"
+                              : "bg-amber-500/15 text-amber-300"
+                          }`}
+                        >
+                          {d.status}
+                        </span>
+                        {d.errorMessage && (
+                          <p className="mt-1 text-xs text-rose-300">{d.errorMessage}</p>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-slate-300">{d.chunkCount}</td>
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          onClick={() => handleDeleteDoc(d.id)}
+                          aria-label={`Delete ${d.title}`}
+                          className="rounded-lg border border-rose-500/30 p-1.5 text-rose-300 hover:bg-rose-500/15"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {docs.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="px-4 py-8 text-center text-slate-500">
+                        No documents indexed yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {tab === "agent" && (
+          <form
+            onSubmit={handleSaveConfig}
+            className="space-y-5 rounded-2xl border border-slate-800 bg-slate-900/50 p-6"
+          >
+            <div className="grid gap-4 md:grid-cols-2">
+              <div>
+                <label className="mb-1 block text-xs uppercase text-slate-400">Pipeline Mode</label>
+                <select
+                  value={cfg.mode}
+                  onChange={(e) => setCfg({ ...cfg, mode: e.target.value as "cascaded" | "realtime" })}
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                >
+                  <option value="cascaded">Cascaded (STT → Vision/RAG LLM → TTS)</option>
+                  <option value="realtime">Realtime Multimodal WebSocket</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs uppercase text-slate-400">
+                  Provider API Key (Write-Only {cfg.apiKeyPreview ? `• Current: ${cfg.apiKeyPreview}` : ""})
+                </label>
+                <input
+                  type="password"
+                  value={newApiKey}
+                  onChange={(e) => setNewApiKey(e.target.value)}
+                  placeholder={cfg.apiKeyPreview || "Enter new API key (leave blank to keep existing)"}
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                />
+              </div>
+
+              {cfg.mode === "realtime" ? (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">Realtime WebSocket URL</label>
+                    <input
+                      type="url"
+                      value={cfg.realtimeWsUrl}
+                      onChange={(e) => setCfg({ ...cfg, realtimeWsUrl: e.target.value })}
+                      placeholder="wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">Realtime Model</label>
+                    <input
+                      type="text"
+                      value={cfg.realtimeModel}
+                      onChange={(e) => setCfg({ ...cfg, realtimeModel: e.target.value })}
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">LLM Base URL</label>
+                    <input
+                      type="url"
+                      value={cfg.llmBaseUrl}
+                      onChange={(e) => setCfg({ ...cfg, llmBaseUrl: e.target.value })}
+                      placeholder="https://api.openai.com/v1"
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">LLM Model</label>
+                    <input
+                      type="text"
+                      value={cfg.llmModel}
+                      onChange={(e) => setCfg({ ...cfg, llmModel: e.target.value })}
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">STT Base URL</label>
+                    <input
+                      type="url"
+                      value={cfg.sttBaseUrl}
+                      onChange={(e) => setCfg({ ...cfg, sttBaseUrl: e.target.value })}
+                      placeholder="https://api.openai.com/v1"
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">TTS Base URL</label>
+                    <input
+                      type="url"
+                      value={cfg.ttsBaseUrl}
+                      onChange={(e) => setCfg({ ...cfg, ttsBaseUrl: e.target.value })}
+                      placeholder="https://api.openai.com/v1"
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                </>
+              )}
+
+              <div>
+                <label className="mb-1 block text-xs uppercase text-slate-400">Embedding Base URL</label>
+                <input
+                  type="url"
+                  value={cfg.embeddingBaseUrl}
+                  onChange={(e) => setCfg({ ...cfg, embeddingBaseUrl: e.target.value })}
+                  placeholder="https://api.openai.com/v1"
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs uppercase text-slate-400">Embedding Model</label>
+                <input
+                  type="text"
+                  value={cfg.embeddingModel}
+                  onChange={(e) => setCfg({ ...cfg, embeddingModel: e.target.value })}
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="mb-1 block text-xs uppercase text-slate-400">System Instructions</label>
+              <textarea
+                rows={3}
+                value={cfg.systemInstructions}
+                onChange={(e) => setCfg({ ...cfg, systemInstructions: e.target.value })}
+                className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              />
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="submit"
+                className="rounded-xl bg-cyan-600 px-5 py-2 text-sm font-medium text-white hover:bg-cyan-500"
+              >
+                Save Encrypted Config
+              </button>
+              <button
+                type="button"
+                onClick={handleTestConnection}
+                disabled={testingConn}
+                className="flex items-center gap-2 rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 hover:bg-slate-800"
+              >
+                {testingConn && <Loader2 className="h-4 w-4 animate-spin" />}
+                Test Connection
+              </button>
+            </div>
+          </form>
+        )}
+
+        {tab === "mcp" && (
+          <div className="space-y-6">
+            <form
+              onSubmit={handleAddMCP}
+              className="grid gap-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 md:grid-cols-5"
+            >
+              <input
+                type="text"
+                required
+                value={mcpName}
+                onChange={(e) => setMcpName(e.target.value)}
+                placeholder="Server Name"
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              />
+              <select
+                value={mcpTransport}
+                onChange={(e) => setMcpTransport(e.target.value as "streamable_http" | "sse")}
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              >
+                <option value="streamable_http">Streamable HTTP</option>
+                <option value="sse">SSE</option>
+              </select>
+              <input
+                type="url"
+                required
+                value={mcpUrl}
+                onChange={(e) => setMcpUrl(e.target.value)}
+                placeholder="https://mcp.example.com/mcp"
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              />
+              <input
+                type="password"
+                value={mcpAuth}
+                onChange={(e) => setMcpAuth(e.target.value)}
+                placeholder="Bearer token (optional)"
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              />
+              <button
+                type="submit"
+                className="rounded-xl bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500"
+              >
+                Register MCP
+              </button>
+            </form>
+
+            <div className="space-y-4">
+              {mcpServers.map((s) => (
+                <div
+                  key={s.id}
+                  className="rounded-2xl border border-slate-800 bg-slate-900/40 p-5"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="font-medium text-white">{s.name}</h3>
+                      <p className="text-xs text-slate-400">
+                        {s.transport} • {s.endpointUrl}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleDiscoverMCP(s.id)}
+                        className="flex items-center gap-1.5 rounded-lg border border-cyan-500/40 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-500/15"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        Discover Tools
+                      </button>
+                      <button
+                        onClick={() => handleDeleteMCP(s.id)}
+                        className="rounded-lg border border-rose-500/30 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/15"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                  {s.discoveredTools && s.discoveredTools.length > 0 && (
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {s.discoveredTools.map((tool) => {
+                        const checked = s.allowedTools?.includes(tool.name);
+                        return (
+                          <label
+                            key={tool.name}
+                            className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-700/70 bg-slate-950/60 px-3 py-1.5 text-xs"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => handleToggleMCPTool(s, tool.name)}
+                            />
+                            <span>{tool.name}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {tab === "audit" && (
+          <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/40">
+            <table className="w-full text-left text-xs">
+              <thead className="border-b border-slate-800 bg-slate-950/60 uppercase text-slate-400">
+                <tr>
+                  <th className="px-4 py-3">Time</th>
+                  <th className="px-4 py-3">Actor</th>
+                  <th className="px-4 py-3">Action</th>
+                  <th className="px-4 py-3">Outcome</th>
+                  <th className="px-4 py-3">IP</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60">
+                {logs.map((l) => (
+                  <tr key={l.id}>
+                    <td className="px-4 py-2.5 text-slate-400">
+                      {new Date(l.createdAt).toLocaleString()}
+                    </td>
+                    <td className="px-4 py-2.5 text-white">{l.actorEmail || "system"}</td>
+                    <td className="px-4 py-2.5 font-mono text-cyan-300">{l.action}</td>
+                    <td className="px-4 py-2.5">
+                      <span
+                        className={`rounded px-2 py-0.5 ${
+                          l.outcome === "success"
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : "bg-rose-500/15 text-rose-300"
+                        }`}
+                      >
+                        {l.outcome}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 text-slate-400">{l.ipAddress}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

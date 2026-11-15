@@ -1,0 +1,25 @@
+services:
+  server:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  stt:
+    image: fedirz/faster-whisper-server:latest-cpu
+    restart: unless-stopped
+    environment:
+      WHISPER__MODEL: ${LOCAL_STT_MODEL:-Systran/faster-whisper-base}
+      # Keep the model resident; reloading costs ~45s on CPU.
+      WHISPER__TTL: -1
+    volumes:
+      - whisper_cache:/root/.cache/huggingface
+    networks:
+      - internal
+
+  tts:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    restart: unless-stopped
+    networks:
+      - internal
+
+volumes:
+  whisper_cache:
