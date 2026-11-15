@@ -27,6 +27,7 @@ type AgentConfig struct {
 	RAGTopK            int
 	RAGMinSimilarity   float64
 	AllowPrivate       bool
+	VoiceLanguages     VoiceLanguageSettings
 }
 
 type EventSink interface {

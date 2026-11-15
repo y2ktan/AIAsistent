@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"aegis-voice/server/internal/agent"
 	"aegis-voice/server/internal/auth"
 	"aegis-voice/server/internal/mcp"
 )
@@ -72,6 +73,8 @@ type AdminStore interface {
 	UpdateUser(ctx context.Context, userID, role string, isActive bool) (*auth.User, error)
 	GetAgentConfig(ctx context.Context) (*AgentConfigRecord, error)
 	UpsertAgentConfig(ctx context.Context, rec *AgentConfigRecord) error
+	GetVoiceLanguages(ctx context.Context) (agent.VoiceLanguageSettings, bool, error)
+	ReplaceVoiceLanguages(ctx context.Context, cfg agent.VoiceLanguageSettings) error
 	ListMCPServers(ctx context.Context) ([]MCPServerRecord, error)
 	GetMCPServer(ctx context.Context, id string) (*MCPServerRecord, error)
 	UpsertMCPServer(ctx context.Context, rec *MCPServerRecord) (*MCPServerRecord, error)

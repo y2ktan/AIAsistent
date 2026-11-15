@@ -110,10 +110,26 @@ func (r *RealtimeAdapter) sendSessionUpdate() error {
 		}
 	}
 
+	vl := r.deps.Config.VoiceLanguages
+	if len(vl.Languages) == 0 {
+		vl = InitialVoiceLanguageSettings(r.deps.Config.TTSVoice)
+	}
+	voiced := vl.VoicedLanguages()
+	voicedNames := make([]string, 0, len(voiced))
+	for _, l := range voiced {
+		voicedNames = append(voicedNames, l.Name)
+	}
+	defLang, _ := vl.Find(vl.DefaultCode)
+	defName := defLang.Name
+	if defName == "" {
+		defName = "English"
+	}
+	langPolicy := "\n\nLANGUAGE POLICY:\n- Supported spoken reply languages: " + strings.Join(voicedNames, ", ") + ".\n- Default language: " + defName + ".\n- Always reply in the language of the user's most recent utterance if it is in the supported spoken list. Otherwise, interpret their message as well as you can, reply in " + defName + ", and tell them once per session (without repeating) that you cannot reply in that language yet."
+
 	return r.writeJSON(map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
-			"instructions": BuildSystemPrompt(r.deps.Config.SystemInstructions),
+			"instructions": BuildSystemPrompt(r.deps.Config.SystemInstructions) + langPolicy,
 			"tools":        tools,
 		},
 	})

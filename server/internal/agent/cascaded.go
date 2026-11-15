@@ -15,8 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/webrtc/v4/pkg/media/oggreader"
-
 	"aegis-voice/server/internal/mcp"
 	"aegis-voice/server/internal/rag"
 	"aegis-voice/server/internal/rtc"
@@ -24,11 +22,16 @@ import (
 )
 
 type CascadedAdapter struct {
-	deps       Dependencies
-	httpClient *http.Client
-	mu         sync.Mutex
-	turnCancel context.CancelFunc
-	speaking   bool
+	deps              Dependencies
+	httpClient        *http.Client
+	mu                sync.Mutex
+	turnCancel        context.CancelFunc
+	speaking          bool
+	disableVerboseSTT bool
+	langState         *LanguageSessionState
+	lastDetectedLang  string
+	lastReplyLang     string
+	lastFallback      bool
 }
 
 func NewCascadedAdapter(deps Dependencies) *CascadedAdapter {
@@ -36,7 +39,21 @@ func NewCascadedAdapter(deps Dependencies) *CascadedAdapter {
 		deps:       deps,
 		// Generous timeout: self-hosted CPU models can take well over a minute on cold start.
 		httpClient: security.NewSafeHTTPClient(deps.Config.AllowPrivate, 180*time.Second),
+		langState:  NewLanguageSessionState(),
 	}
+}
+
+func (c *CascadedAdapter) voiceLanguages() VoiceLanguageSettings {
+	if len(c.deps.Config.VoiceLanguages.Languages) > 0 {
+		return c.deps.Config.VoiceLanguages
+	}
+	return InitialVoiceLanguageSettings(c.deps.Config.TTSVoice)
+}
+
+func (c *CascadedAdapter) LastTurnLanguage() (detected, reply string, fallback bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastDetectedLang, c.lastReplyLang, c.lastFallback
 }
 
 func (c *CascadedAdapter) Start(_ context.Context) error {
@@ -92,7 +109,7 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 	c.deps.Sink.SendEvent(rtc.NewStateEvent("thinking"))
 
 	// 1. Speech-to-Text
-	userText, err := c.transcribe(turnCtx, audioData)
+	userText, sttLang, err := c.transcribe(turnCtx, audioData)
 	if err != nil {
 		// A barge-in cancels the in-flight turn; that is not a user-facing failure.
 		if turnCtx.Err() != nil {
@@ -107,6 +124,22 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		return nil
 	}
 	c.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "user", userText))
+
+	vl := c.voiceLanguages()
+	detectedCode, detectedName := DetectUtteranceLanguage(sttLang, userText, vl)
+	c.mu.Lock()
+	if c.langState == nil {
+		c.langState = NewLanguageSessionState()
+	}
+	langRes := ResolveReplyLanguage(detectedCode, detectedName, vl, c.langState)
+	c.lastDetectedLang = detectedCode
+	if c.lastDetectedLang == "" {
+		c.lastDetectedLang = detectedName
+	}
+	c.lastReplyLang = langRes.ReplyCode
+	c.lastFallback = langRes.Fallback
+	c.mu.Unlock()
+	langInstruction := BuildLanguageSystemInstruction(langRes)
 
 	// 2. RAG Retrieval
 	var ragContext string
@@ -130,7 +163,7 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		videoFrame = frame
 	}
 
-	reply, err := c.chatWithTools(turnCtx, userText, ragContext, videoFrame)
+	reply, err := c.chatWithTools(turnCtx, userText, ragContext, videoFrame, langInstruction)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || turnCtx.Err() != nil {
 			return err
@@ -143,11 +176,17 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 	reply = SanitizeAssistantOutput(reply, []string{cfg.APIKey})
 	c.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "assistant", reply))
 
+	voice, actualCode := GuardVoiceForReply(reply, langRes, vl)
+	c.mu.Lock()
+	c.langState.LastReplyCode = actualCode
+	c.lastReplyLang = actualCode
+	c.mu.Unlock()
+
 	// 4. Streaming TTS
 	if cfg.TTSBaseURL != "" && reply != "" {
 		c.deps.Sink.SendEvent(rtc.NewStateEvent("speaking"))
 		c.setSpeaking(true)
-		err := c.synthesizeAndStream(turnCtx, reply)
+		err := c.synthesizeAndStream(turnCtx, reply, voice)
 		c.setSpeaking(false)
 		if err != nil && !errors.Is(err, context.Canceled) && turnCtx.Err() == nil {
 			c.deps.Sink.SendEvent(rtc.NewErrorEvent("Speech synthesis failed."))
@@ -160,61 +199,82 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 	return nil
 }
 
-func (c *CascadedAdapter) transcribe(ctx context.Context, audioData []byte) (string, error) {
+func (c *CascadedAdapter) transcribe(ctx context.Context, audioData []byte) (string, string, error) {
 	baseURL := strings.TrimRight(c.deps.Config.STTBaseURL, "/")
 	if baseURL == "" {
 		baseURL = strings.TrimRight(c.deps.Config.LLMBaseURL, "/")
 	}
 	policy := security.SSRFPolicy{AllowPrivate: c.deps.Config.AllowPrivate}
 	if _, err := policy.ValidateHTTPURL(baseURL); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	model := c.deps.Config.STTModel
-	if model == "" {
-		model = "whisper-1"
-	}
-	_ = mw.WriteField("model", model)
-	filename := "audio.wav"
-	if bytes.HasPrefix(audioData, []byte("OggS")) {
-		filename = "audio.ogg"
-	}
-	fw, err := mw.CreateFormFile("file", filename)
-	if err != nil {
-		return "", err
-	}
-	_, _ = fw.Write(audioData)
-	_ = mw.Close()
+	c.mu.Lock()
+	useVerbose := !c.disableVerboseSTT
+	c.mu.Unlock()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/audio/transcriptions", &buf)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	if c.deps.Config.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.deps.Config.APIKey)
-	}
+	for attempt := 0; attempt < 2; attempt++ {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		model := c.deps.Config.STTModel
+		if model == "" {
+			model = "whisper-1"
+		}
+		_ = mw.WriteField("model", model)
+		if useVerbose {
+			_ = mw.WriteField("response_format", "verbose_json")
+		}
+		filename := "audio.wav"
+		if bytes.HasPrefix(audioData, []byte("OggS")) {
+			filename = "audio.ogg"
+		}
+		fw, err := mw.CreateFormFile("file", filename)
+		if err != nil {
+			return "", "", err
+		}
+		_, _ = fw.Write(audioData)
+		_ = mw.Close()
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/audio/transcriptions", &buf)
+		if err != nil {
+			return "", "", err
+		}
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		if c.deps.Config.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.deps.Config.APIKey)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return "", "", err
+		}
+		if resp.StatusCode == http.StatusBadRequest && useVerbose {
+			_ = resp.Body.Close()
+			c.mu.Lock()
+			c.disableVerboseSTT = true
+			c.mu.Unlock()
+			useVerbose = false
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			return "", "", fmt.Errorf("stt status %d", resp.StatusCode)
+		}
+		var out struct {
+			Text     string `json:"text"`
+			Language string `json:"language"`
+		}
+		decErr := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&out)
+		_ = resp.Body.Close()
+		if decErr != nil {
+			return "", "", decErr
+		}
+		return out.Text, out.Language, nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("stt status %d", resp.StatusCode)
-	}
-	var out struct {
-		Text string `json:"text"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&out); err != nil {
-		return "", err
-	}
-	return out.Text, nil
+	return "", "", errors.New("stt request failed")
 }
 
-func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContext string, videoFrame []byte) (string, error) {
+func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContext string, videoFrame []byte, langInstruction string) (string, error) {
 	baseURL := strings.TrimRight(c.deps.Config.LLMBaseURL, "/")
 	policy := security.SSRFPolicy{AllowPrivate: c.deps.Config.AllowPrivate}
 	if _, err := policy.ValidateHTTPURL(baseURL); err != nil {
@@ -223,6 +283,12 @@ func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContex
 
 	messages := []map[string]any{
 		{"role": "system", "content": BuildSystemPrompt(c.deps.Config.SystemInstructions)},
+	}
+	if langInstruction != "" {
+		messages = append(messages, map[string]any{
+			"role":    "system",
+			"content": langInstruction,
+		})
 	}
 	if ragContext != "" {
 		messages = append(messages, map[string]any{
@@ -383,7 +449,7 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text string) error {
+func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text, voice string) error {
 	baseURL := strings.TrimRight(c.deps.Config.TTSBaseURL, "/")
 	policy := security.SSRFPolicy{AllowPrivate: c.deps.Config.AllowPrivate}
 	if _, err := policy.ValidateHTTPURL(baseURL); err != nil {
@@ -394,8 +460,10 @@ func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text string) 
 	if model == "" {
 		model = "tts-1"
 	}
-	voice := c.deps.Config.TTSVoice
-	if voice == "" {
+	if strings.TrimSpace(voice) == "" {
+		voice = c.deps.Config.TTSVoice
+	}
+	if strings.TrimSpace(voice) == "" {
 		voice = "alloy"
 	}
 	payload, _ := json.Marshal(map[string]any{
@@ -426,36 +494,32 @@ func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text string) 
 	br := bufio.NewReader(resp.Body)
 	magic, peekErr := br.Peek(4)
 	if peekErr == nil && string(magic) == "OggS" {
-		ogg, _, oggErr := oggreader.NewWith(br)
-		if oggErr != nil {
-			return oggErr
-		}
+		reader := NewOggPacketReader(br)
+		start := time.Now()
+		var sent time.Duration
 		for {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
 			}
-			payload, pageHeader, err := ogg.ParseNextPage()
+			pkt, err := reader.NextPacket()
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
 				return err
 			}
-			if pageHeader.GranulePosition == 0 ||
-				bytes.HasPrefix(payload, []byte("OpusHead")) ||
-				bytes.HasPrefix(payload, []byte("OpusTags")) {
-				continue
+			dur := OpusPacketDuration(pkt)
+			if wErr := c.deps.Sink.WriteAudioSample(pkt, dur); wErr != nil {
+				return wErr
 			}
-			if len(payload) > 0 {
-				if wErr := c.deps.Sink.WriteAudioSample(payload, 20*time.Millisecond); wErr != nil {
-					return wErr
-				}
+			sent += dur
+			if wait := sent - time.Since(start); wait > 0 {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case <-time.After(20 * time.Millisecond):
+				case <-time.After(wait):
 				}
 			}
 		}

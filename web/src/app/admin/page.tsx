@@ -19,6 +19,13 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
+import {
+  addLanguage,
+  availableCatalogLanguages,
+  canRemoveLanguage,
+  removeLanguage,
+  type VoiceLanguageSettings,
+} from "@/lib/voice-languages";
 
 type Tab = "users" | "rag" | "agent" | "mcp" | "audit";
 
@@ -115,6 +122,16 @@ export default function AdminPage() {
   const [newApiKey, setNewApiKey] = useState("");
   const [testingConn, setTestingConn] = useState(false);
 
+  // Voice languages state
+  const [voiceLangs, setVoiceLangs] = useState<VoiceLanguageSettings>({
+    languages: [],
+    defaultLanguage: "en",
+    saved: false,
+    catalog: [],
+  });
+  const [selectedAddLang, setSelectedAddLang] = useState("");
+  const [savingVoiceLangs, setSavingVoiceLangs] = useState(false);
+
   // MCP state
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([]);
   const [mcpName, setMcpName] = useState("");
@@ -142,16 +159,22 @@ export default function AdminPage() {
 
   async function loadAll() {
     try {
-      const [uRes, dRes, cRes, mRes, aRes] = await Promise.all([
+      const [uRes, dRes, cRes, vlRes, mRes, aRes] = await Promise.all([
         apiFetch<{ users: AuthUser[] }>("/api/v1/admin/users"),
         apiFetch<{ documents: DocRecord[] }>("/api/v1/admin/documents"),
         apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config"),
+        apiFetch<VoiceLanguageSettings>("/api/v1/admin/voice-languages"),
         apiFetch<{ servers: MCPServer[] }>("/api/v1/admin/mcp-servers"),
         apiFetch<{ logs: AuditLog[] }>("/api/v1/admin/audit-logs"),
       ]);
       setUsers(uRes.users || []);
       setDocs(dRes.documents || []);
       if (cRes.config) setCfg(cRes.config);
+      if (vlRes) {
+        setVoiceLangs(vlRes);
+        const avail = availableCatalogLanguages(vlRes.languages || [], vlRes.catalog || []);
+        setSelectedAddLang(avail[0]?.code || "");
+      }
       setMcpServers(mRes.servers || []);
       setLogs(aRes.logs || []);
     } catch (err) {
@@ -282,6 +305,28 @@ export default function AdminPage() {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Connection test failed" });
     } finally {
       setTestingConn(false);
+    }
+  }
+
+  async function handleSaveVoiceLanguages() {
+    setSavingVoiceLangs(true);
+    setNotice(null);
+    try {
+      const res = await apiFetch<VoiceLanguageSettings>("/api/v1/admin/voice-languages", {
+        method: "PUT",
+        body: JSON.stringify({
+          languages: voiceLangs.languages,
+          defaultLanguage: voiceLangs.defaultLanguage,
+        }),
+      });
+      setVoiceLangs(res);
+      const avail = availableCatalogLanguages(res.languages || [], res.catalog || []);
+      setSelectedAddLang(avail[0]?.code || "");
+      setNotice({ type: "ok", text: "Voice languages saved." });
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to save voice languages" });
+    } finally {
+      setSavingVoiceLangs(false);
     }
   }
 
@@ -611,6 +656,7 @@ export default function AdminPage() {
         )}
 
         {tab === "agent" && (
+          <div className="space-y-6">
           <form
             onSubmit={handleSaveConfig}
             className="space-y-5 rounded-2xl border border-slate-800 bg-slate-900/50 p-6"
@@ -755,6 +801,133 @@ export default function AdminPage() {
               </button>
             </div>
           </form>
+
+          <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-6">
+            <div>
+              <h2 className="text-base font-semibold text-white">Voice languages</h2>
+              <p className="mt-1 text-xs text-slate-400">
+                Choose which spoken languages the assistant handles, assign a speech voice per language, and pick one default language for fallback replies.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              {voiceLangs.languages.map((lang) => {
+                const isDefault = lang.code === voiceLangs.defaultLanguage;
+                const removable = canRemoveLanguage(lang.code, voiceLangs.defaultLanguage);
+                return (
+                  <div
+                    key={lang.code}
+                    className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-800/80 bg-slate-950/60 px-3 py-2.5"
+                  >
+                    <div className="min-w-[160px]">
+                      <span className="text-sm font-medium text-white">{lang.name}</span>
+                      <span className="ml-2 rounded bg-slate-800 px-1.5 py-0.5 text-[11px] uppercase text-slate-400">
+                        {lang.code}
+                      </span>
+                    </div>
+
+                    <div className="flex-1 min-w-[180px]">
+                      <input
+                        type="text"
+                        value={lang.voice}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setVoiceLangs((prev) => ({
+                            ...prev,
+                            languages: prev.languages.map((item) =>
+                              item.code === lang.code ? { ...item, voice: v } : item
+                            ),
+                          }));
+                        }}
+                        placeholder="Voice name (e.g. af_heart, zf_xiaoxiao)"
+                        aria-label={`Voice for ${lang.name}`}
+                        className="w-full rounded-lg border border-slate-700/60 bg-slate-900 px-2.5 py-1.5 text-sm text-white"
+                      />
+                      {lang.voice.trim() === "" && (
+                        <p className="mt-1 text-[11px] text-amber-400/90">
+                          No voice assigned — replies will be spoken in the default language.
+                        </p>
+                      )}
+                    </div>
+
+                    <label className="flex items-center gap-1.5 text-xs text-slate-300">
+                      <input
+                        type="radio"
+                        name="defaultVoiceLanguage"
+                        checked={isDefault}
+                        onChange={() =>
+                          setVoiceLangs((prev) => ({ ...prev, defaultLanguage: lang.code }))
+                        }
+                      />
+                      Default
+                    </label>
+
+                    <button
+                      type="button"
+                      disabled={!removable}
+                      title={
+                        removable
+                          ? `Remove ${lang.name}`
+                          : "Choose another default language before removing this one"
+                      }
+                      onClick={() => {
+                        setVoiceLangs((prev) => {
+                          const nextList = removeLanguage(prev.languages, prev.defaultLanguage, lang.code);
+                          const avail = availableCatalogLanguages(nextList, prev.catalog);
+                          if (!selectedAddLang && avail[0]) setSelectedAddLang(avail[0].code);
+                          return { ...prev, languages: nextList };
+                        });
+                      }}
+                      className="rounded-lg border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <select
+                value={selectedAddLang}
+                onChange={(e) => setSelectedAddLang(e.target.value)}
+                aria-label="Language to add"
+                className="rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+              >
+                {availableCatalogLanguages(voiceLangs.languages, voiceLangs.catalog).map((item) => (
+                  <option key={item.code} value={item.code}>
+                    {item.name} ({item.code})
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={!selectedAddLang}
+                onClick={() => {
+                  if (!selectedAddLang) return;
+                  setVoiceLangs((prev) => {
+                    const nextList = addLanguage(prev.languages, prev.catalog, selectedAddLang);
+                    const avail = availableCatalogLanguages(nextList, prev.catalog);
+                    setSelectedAddLang(avail[0]?.code || "");
+                    return { ...prev, languages: nextList };
+                  });
+                }}
+                className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-40"
+              >
+                Add Language
+              </button>
+              <button
+                type="button"
+                disabled={savingVoiceLangs}
+                onClick={handleSaveVoiceLanguages}
+                className="ml-auto flex items-center gap-2 rounded-xl bg-cyan-600 px-5 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-60"
+              >
+                {savingVoiceLangs && <Loader2 className="h-4 w-4 animate-spin" />}
+                Save Voice Languages
+              </button>
+            </div>
+          </div>
+          </div>
         )}
 
         {tab === "mcp" && (

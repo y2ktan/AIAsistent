@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"aegis-voice/server/internal/agent"
 	"aegis-voice/server/internal/auth"
 )
 
@@ -290,4 +291,58 @@ func (s *PGAdminStore) ListAuditLogs(ctx context.Context, limit, offset int) ([]
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *PGAdminStore) GetVoiceLanguages(ctx context.Context) (agent.VoiceLanguageSettings, bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT code, name, voice, is_default
+		FROM voice_languages
+		ORDER BY position ASC, code ASC
+	`)
+	if err != nil {
+		return agent.VoiceLanguageSettings{}, false, err
+	}
+	defer rows.Close()
+
+	var out agent.VoiceLanguageSettings
+	for rows.Next() {
+		var l agent.VoiceLanguage
+		var isDef bool
+		if err := rows.Scan(&l.Code, &l.Name, &l.Voice, &isDef); err != nil {
+			return agent.VoiceLanguageSettings{}, false, err
+		}
+		out.Languages = append(out.Languages, l)
+		if isDef {
+			out.DefaultCode = l.Code
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return agent.VoiceLanguageSettings{}, false, err
+	}
+	if len(out.Languages) == 0 {
+		return agent.VoiceLanguageSettings{}, false, nil
+	}
+	return out, true, nil
+}
+
+func (s *PGAdminStore) ReplaceVoiceLanguages(ctx context.Context, cfg agent.VoiceLanguageSettings) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `DELETE FROM voice_languages`); err != nil {
+		return err
+	}
+	for i, l := range cfg.Languages {
+		isDef := l.Code == cfg.DefaultCode
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO voice_languages (code, name, voice, is_default, position, updated_at)
+			VALUES ($1, $2, $3, $4, $5, NOW())
+		`, l.Code, l.Name, l.Voice, isDef, i); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }

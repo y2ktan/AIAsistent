@@ -153,10 +153,6 @@ export function useVoiceAgentRTC() {
         setActiveTool(ev.tool || "tool");
         break;
       case "barge_in":
-        if (remoteAudioRef.current) {
-          remoteAudioRef.current.pause();
-          remoteAudioRef.current.currentTime = 0;
-        }
         break;
       case "error":
         setErrorMsg(ev.message || "Assistant error");

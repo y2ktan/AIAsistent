@@ -124,6 +124,16 @@ ON CONFLICT (name) DO UPDATE SET
   embedding_model = EXCLUDED.embedding_model,
   embedding_dim = EXCLUDED.embedding_dim,
   updated_at = NOW();
+
+INSERT INTO voice_languages (code, name, voice, is_default, position)
+SELECT v.code, v.name, v.voice, v.is_default, v.position
+FROM (VALUES
+  ('en',  'English',          '${TTS_VOICE}', TRUE,  0),
+  ('zh',  'Mandarin Chinese', 'zf_xiaoxiao',  FALSE, 1),
+  ('yue', 'Cantonese',        '',             FALSE, 2),
+  ('ms',  'Malay',            '',             FALSE, 3)
+) AS v(code, name, voice, is_default, position)
+WHERE NOT EXISTS (SELECT 1 FROM voice_languages);
 SQL
 
 echo "==> Warming up local STT model (first load can take ~1 minute on CPU)..."

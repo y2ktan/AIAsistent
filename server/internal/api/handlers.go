@@ -324,6 +324,105 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"config": rec})
 }
 
+func (s *Server) effectiveVoiceLanguages(ctx context.Context) (agent.VoiceLanguageSettings, bool, error) {
+	vl, saved, err := s.adminStore.GetVoiceLanguages(ctx)
+	if err != nil {
+		return agent.VoiceLanguageSettings{}, false, err
+	}
+	if !saved {
+		cfg, cfgErr := s.adminStore.GetAgentConfig(ctx)
+		englishVoice := ""
+		if cfgErr == nil && cfg != nil {
+			englishVoice = cfg.TTSVoice
+		}
+		return agent.InitialVoiceLanguageSettings(englishVoice), false, nil
+	}
+	return vl, true, nil
+}
+
+func (s *Server) HandleGetVoiceLanguages(w http.ResponseWriter, r *http.Request) {
+	vl, saved, err := s.effectiveVoiceLanguages(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load voice languages"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"languages":       vl.Languages,
+		"defaultLanguage": vl.DefaultCode,
+		"saved":           saved,
+		"catalog":         agent.LanguageCatalog(),
+	})
+}
+
+func (s *Server) HandleUpdateVoiceLanguages(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Languages       []agent.VoiceLanguage `json:"languages"`
+		DefaultLanguage string                `json:"defaultLanguage"`
+	}
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+
+	next := agent.VoiceLanguageSettings{
+		DefaultCode: strings.ToLower(strings.TrimSpace(req.DefaultLanguage)),
+		Languages:   make([]agent.VoiceLanguage, 0, len(req.Languages)),
+	}
+	for _, l := range req.Languages {
+		code := strings.ToLower(strings.TrimSpace(l.Code))
+		name := strings.TrimSpace(l.Name)
+		if entry, ok := agent.LookupCatalogLanguage(code); ok {
+			name = entry.Name
+		}
+		next.Languages = append(next.Languages, agent.VoiceLanguage{
+			Code:  code,
+			Name:  name,
+			Voice: strings.TrimSpace(l.Voice),
+		})
+	}
+
+	if err := agent.ValidateVoiceLanguageSettings(next); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	prev, _, _ := s.effectiveVoiceLanguages(r.Context())
+	prevSet := make(map[string]bool, len(prev.Languages))
+	for _, l := range prev.Languages {
+		prevSet[l.Code] = true
+	}
+	nextSet := make(map[string]bool, len(next.Languages))
+	var added []string
+	for _, l := range next.Languages {
+		nextSet[l.Code] = true
+		if !prevSet[l.Code] {
+			added = append(added, l.Code)
+		}
+	}
+	var removed []string
+	for _, l := range prev.Languages {
+		if !nextSet[l.Code] {
+			removed = append(removed, l.Code)
+		}
+	}
+
+	if err := s.adminStore.ReplaceVoiceLanguages(r.Context(), next); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save voice languages"})
+		return
+	}
+	s.audit(r.Context(), r, "admin.voice_languages.update", "voice_languages", "default", "success", map[string]any{
+		"added":           added,
+		"removed":         removed,
+		"defaultLanguage": next.DefaultCode,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"languages":       next.Languages,
+		"defaultLanguage": next.DefaultCode,
+		"saved":           true,
+		"catalog":         agent.LanguageCatalog(),
+	})
+}
+
 func (s *Server) HandleTestAgentConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, err := s.adminStore.GetAgentConfig(r.Context())
 	if err != nil {
@@ -554,6 +653,7 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 		})
 	}
 
+	vl, _, _ := s.effectiveVoiceLanguages(ctx)
 	emb, _ := s.activeEmbedder(ctx)
 	deps := agent.Dependencies{
 		Config: agent.AgentConfig{
@@ -574,6 +674,7 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 			RAGTopK:            cfgRec.RAGTopK,
 			RAGMinSimilarity:   cfgRec.RAGMinSimilarity,
 			AllowPrivate:       s.allowPrivate,
+			VoiceLanguages:     vl,
 		},
 		Sink:       ps,
 		RAGService: s.ragSvc,
@@ -634,13 +735,14 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 		go func() {
 			start := time.Now()
 			err := cascaded.ProcessTurn(ctx, oggAudio)
+			detectedLang, replyLang, fallback := cascaded.LastTurnLanguage()
 			switch {
 			case err == nil:
-				s.logger.Info("cascaded turn complete", "peerId", ps.ID, "frames", len(captured), "took", time.Since(start).String())
+				s.logger.Info("cascaded turn complete", "peerId", ps.ID, "frames", len(captured), "detectedLang", detectedLang, "replyLang", replyLang, "fallback", fallback, "took", time.Since(start).String())
 			case errors.Is(err, context.Canceled):
 				s.logger.Info("cascaded turn cancelled by barge-in", "peerId", ps.ID, "took", time.Since(start).String())
 			default:
-				s.logger.Warn("cascaded turn failed", "peerId", ps.ID, "error", err, "took", time.Since(start).String())
+				s.logger.Warn("cascaded turn failed", "peerId", ps.ID, "detectedLang", detectedLang, "replyLang", replyLang, "fallback", fallback, "error", err, "took", time.Since(start).String())
 			}
 		}()
 	}

@@ -50,3 +50,13 @@ cp .env.example .env
 ## Pion WebRTC UDP Mux Port Settings
 
 To avoid exposing thousands of ephemeral UDP ports in Docker, Pion's `SettingEngine` is configured with a single-port `ICEMux` (`ICE_UDP_MUX_PORT=8443` by default) and TCP ICE fallback on the same port (`8443/udp` and `8443/tcp` in `docker-compose.yml`). When deploying behind a cloud firewall or NAT, open `8443/udp` and `8443/tcp` and set `ICE_PUBLIC_IP` to your host's reachable public IP.
+
+## Voice Languages
+
+Configure supported spoken languages in **`/admin` → AI Agent → Voice languages**:
+
+- **Initial languages**: On a fresh install, English (default), Mandarin Chinese, Cantonese, and Malay are listed.
+- **Default language rules**: Exactly one language must be marked as the default, and the default language must have an assigned voice. You cannot remove the default language until you select another default.
+- **Per-language voices & fallback**: In `cascaded` mode, replies are spoken using the voice assigned to the reply's language. If a user speaks an unsupported language—or a supported language with no assigned voice—the assistant answers in the default language and notifies the user once per session that it cannot reply in that language.
+- **Cantonese & Malay voices**: The bundled local Kokoro TTS engine provides English and Mandarin voices (`af_heart`, `zf_xiaoxiao`) out of the box. To speak Cantonese or Malay instead of falling back to the default language, configure a TTS engine that provides voices for them and assign those voice names in `/admin`.
+

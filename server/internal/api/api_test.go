@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"aegis-voice/server/internal/agent"
 	"aegis-voice/server/internal/auth"
 	"aegis-voice/server/internal/mcp"
 	"aegis-voice/server/internal/rag"
@@ -24,6 +25,7 @@ type mockAllStore struct {
 	sessions        map[string]*auth.Session
 	signalingTokens map[string]*auth.SignalingToken
 	agentCfg        *AgentConfigRecord
+	voiceLangs      *agent.VoiceLanguageSettings
 	mcpServers      map[string]*MCPServerRecord
 	audits          []AuditLogRecord
 	seq             int
@@ -202,6 +204,26 @@ func (m *mockAllStore) UpsertAgentConfig(_ context.Context, rec *AgentConfigReco
 	return nil
 }
 
+func (m *mockAllStore) GetVoiceLanguages(_ context.Context) (agent.VoiceLanguageSettings, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.voiceLangs == nil {
+		return agent.VoiceLanguageSettings{}, false, nil
+	}
+	cp := *m.voiceLangs
+	cp.Languages = append([]agent.VoiceLanguage(nil), m.voiceLangs.Languages...)
+	return cp, true, nil
+}
+
+func (m *mockAllStore) ReplaceVoiceLanguages(_ context.Context, cfg agent.VoiceLanguageSettings) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := cfg
+	cp.Languages = append([]agent.VoiceLanguage(nil), cfg.Languages...)
+	m.voiceLangs = &cp
+	return nil
+}
+
 func (m *mockAllStore) ListMCPServers(_ context.Context) ([]MCPServerRecord, error) { return nil, nil }
 func (m *mockAllStore) GetMCPServer(_ context.Context, _ string) (*MCPServerRecord, error) { return nil, ErrNotFound }
 func (m *mockAllStore) UpsertMCPServer(_ context.Context, rec *MCPServerRecord) (*MCPServerRecord, error) { return rec, nil }
@@ -299,5 +321,144 @@ func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "admin.agent_config.update") {
 		t.Fatalf("expected audit log entry, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestVoiceLanguagesAdminAPI(t *testing.T) {
+	store := newMockAllStore()
+	store.agentCfg.TTSVoice = "af_heart"
+	vault, _ := security.NewVault(make([]byte, 32))
+	authSvc := auth.NewService(store, auth.Config{
+		WebOrigin:           "https://aegis.local",
+		AdminBootstrapToken: "boot-123",
+	}, nil)
+	rtcMgr, _ := rtc.NewManager(rtc.Config{}, nil)
+	defer rtcMgr.Close()
+
+	srv := NewServer(authSvc, store, store, rag.NewService(nil, 0), rtcMgr, mcp.NewHost(false), vault, false, nil)
+	router := srv.Router()
+
+	// Bootstrap admin
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/bootstrap", bytes.NewBufferString(`{"bootstrapToken":"boot-123","email":"admin@aegis.local","password":"AdminPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("bootstrap failed: %d", rec.Code)
+	}
+	var bootResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &bootResp)
+	adminCookie := rec.Result().Cookies()[0]
+
+	// Create regular user and log them in
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026","role":"user"}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create user failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("user login failed: %d", rec.Code)
+	}
+	var userLogin struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &userLogin)
+	userCookie := rec.Result().Cookies()[0]
+
+	// 1. First read shows initial 4 languages with English as default
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/voice-languages", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET voice-languages failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var getResp struct {
+		Languages       []agent.VoiceLanguage `json:"languages"`
+		DefaultLanguage string                `json:"defaultLanguage"`
+		Saved           bool                  `json:"saved"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &getResp)
+	if getResp.Saved || getResp.DefaultLanguage != "en" || len(getResp.Languages) != 4 || getResp.Languages[0].Voice != "af_heart" {
+		t.Fatalf("unexpected initial GET response: %+v", getResp)
+	}
+
+	// 2. Non-admin gets 403
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/voice-languages", bytes.NewBufferString(`{"defaultLanguage":"en","languages":[{"code":"en","voice":"af_heart"}]}`))
+	req.AddCookie(userCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", userLogin.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin, got %d", rec.Code)
+	}
+
+	// 3. Add Japanese and remove Malay, then verify persistence
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/voice-languages", bytes.NewBufferString(`{"defaultLanguage":"en","languages":[{"code":"en","voice":"af_heart"},{"code":"zh","voice":"zf_xiaoxiao"},{"code":"ja","voice":""}]}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT voice-languages failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/voice-languages", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	_ = json.Unmarshal(rec.Body.Bytes(), &getResp)
+	if !getResp.Saved || len(getResp.Languages) != 3 || getResp.Languages[2].Code != "ja" {
+		t.Fatalf("expected persisted 3 languages with ja, got %+v", getResp)
+	}
+
+	// 4. Invalid saves return 400 and leave stored list unchanged
+	badPayloads := []string{
+		`{"defaultLanguage":"en","languages":[{"code":"en","voice":"af_heart"},{"code":"en","voice":"v2"}]}`,
+		`{"defaultLanguage":"en","languages":[{"code":"zh","voice":"zf_xiaoxiao"}]}`,
+		`{"defaultLanguage":"en","languages":[{"code":"en","voice":""}]}`,
+	}
+	for _, body := range badPayloads {
+		req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/voice-languages", bytes.NewBufferString(body))
+		req.AddCookie(adminCookie)
+		req.Header.Set("Origin", "https://aegis.local")
+		req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+		rec = httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for payload %s, got %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Verify stored list unchanged after rejections
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/voice-languages", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	_ = json.Unmarshal(rec.Body.Bytes(), &getResp)
+	if len(getResp.Languages) != 3 {
+		t.Fatalf("expected stored list unchanged (3), got %d", len(getResp.Languages))
+	}
+
+	// 5. Audit log recorded
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit-logs", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "admin.voice_languages.update") {
+		t.Fatalf("expected audit log entry for voice_languages, got %d %s", rec.Code, rec.Body.String())
 	}
 }
