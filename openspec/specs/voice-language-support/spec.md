@@ -59,7 +59,7 @@ The system SHALL let administrators assign a speech voice to each supported lang
 - **THEN** the language is saved and the settings view indicates that the assistant will answer that language in the default language
 
 ### Requirement: Replies follow the user's spoken language
-The system SHALL reply, in both transcript text and speech, in the language of the user's most recent utterance when that language is supported and has an assigned voice.
+The system SHALL reply, in both transcript text and speech, in the language of the user's most recent utterance when that language is supported and has an assigned voice, and SHALL prefer the configured default language when disambiguating ambiguous same-script utterances or falling back when no language is detected on an initial turn.
 
 #### Scenario: User speaks a supported language
 - **WHEN** Mandarin Chinese is supported with an assigned voice and the user asks a question in Mandarin
@@ -73,9 +73,13 @@ The system SHALL reply, in both transcript text and speech, in the language of t
 - **WHEN** a single utterance mixes two supported languages
 - **THEN** the assistant replies in the language that makes up most of the utterance
 
+#### Scenario: Ambiguous same-script utterance prefers configured default language
+- **WHEN** the dominant script of an utterance matches multiple configured languages and speech-to-text does not provide a matching language label, while the configured default language belongs to that script family
+- **THEN** the assistant resolves the utterance to the configured default language
+
 #### Scenario: Language of an utterance cannot be determined
-- **WHEN** the language of an utterance cannot be determined, such as a one-word acknowledgement
-- **THEN** the assistant replies in the language of its previous reply in that session, or in the default language if there is no previous reply
+- **WHEN** the language of an utterance cannot be determined, such as a one-word acknowledgement or unclear audio
+- **THEN** the assistant replies in the language of its previous reply in that session, or in the configured default language (such as Mandarin Chinese when set as default) if there is no previous reply
 
 ### Requirement: Spoken replies use the voice of the reply language
 In `cascaded` mode, the system SHALL synthesize each spoken reply with the voice assigned to the language the reply is written in.

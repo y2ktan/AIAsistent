@@ -209,8 +209,8 @@ func TestRealtimeAdapterWebSocketBridge(t *testing.T) {
 		if !strings.Contains(string(msg), "session.update") {
 			t.Errorf("expected session.update, got %s", string(msg))
 		}
-		if !strings.Contains(string(msg), "Mandarin Chinese") || !strings.Contains(string(msg), "Default language: English") {
-			t.Errorf("expected language policy in session.update instructions, got %s", string(msg))
+		if !strings.Contains(string(msg), "Mandarin Chinese") || !strings.Contains(string(msg), "Default language: Mandarin Chinese") || !strings.Contains(string(msg), "cannot be determined") {
+			t.Errorf("expected language policy with undetermined fallback in session.update instructions, got %s", string(msg))
 		}
 
 		// Send audio + transcript delta
@@ -234,7 +234,7 @@ func TestRealtimeAdapterWebSocketBridge(t *testing.T) {
 			APIKey:        "sk-realtime-test",
 			AllowPrivate:  true,
 			VoiceLanguages: VoiceLanguageSettings{
-				DefaultCode: "en",
+				DefaultCode: "zh",
 				Languages: []VoiceLanguage{
 					{Code: "en", Name: "English", Voice: "af_heart"},
 					{Code: "zh", Name: "Mandarin Chinese", Voice: "zf_xiaoxiao"},
@@ -305,12 +305,14 @@ func TestCascadedMultilingualRoutingNoticeAndVoiceGuard(t *testing.T) {
 		{"你好嗎請問", "yue"},
 		{"再問一次你好嗎", "yue"},
 		{"请用中文回答我", "zh"},
+		{"Hello 你好", "en"},
 	}
 	var llmQueue = []string{
 		"今天是十五号。",
 		"I cannot speak Cantonese yet, it is 3 PM.",
 		"It is 3 PM.",
 		"Hello, I answered in English instead.",
+		"你好！",
 	}
 
 	var llmSysPrompts []string
@@ -373,7 +375,7 @@ func TestCascadedMultilingualRoutingNoticeAndVoiceGuard(t *testing.T) {
 		Sink: &mockSink{},
 	})
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < len(sttQueue); i++ {
 		turnIdx = i
 		if err := adapter.ProcessTurn(context.Background(), []byte("ogg")); err != nil {
 			t.Fatalf("turn %d failed: %v", i, err)
@@ -404,5 +406,12 @@ func TestCascadedMultilingualRoutingNoticeAndVoiceGuard(t *testing.T) {
 	// Turn 3: Mandarin requested, but LLM replied in English -> script guard picks af_heart
 	if ttsVoices[3] != "af_heart" {
 		t.Fatalf("turn 3 expected script guard to pick af_heart, got %s", ttsVoices[3])
+	}
+
+	if !strings.Contains(llmSysPrompts[4], "Reply ONLY in Mandarin Chinese") {
+		t.Fatalf("turn 4 expected Mandarin instruction for mixed greeting, got: %s", llmSysPrompts[4])
+	}
+	if ttsVoices[4] != "zf_xiaoxiao" {
+		t.Fatalf("turn 4 expected zf_xiaoxiao, got %s", ttsVoices[4])
 	}
 }

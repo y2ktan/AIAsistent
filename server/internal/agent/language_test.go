@@ -91,6 +91,30 @@ func TestSTTNormalizationScriptAndWordUnits(t *testing.T) {
 	}
 }
 
+func TestDetectUtteranceLanguageMixedScripts(t *testing.T) {
+	settings := InitialVoiceLanguageSettings("af_heart")
+	tests := []struct {
+		name       string
+		label      string
+		transcript string
+		want       string
+	}{
+		{"Chinese greeting with English label", "en", "Hello 你好", "zh"},
+		{"Chinese greeting without label", "", "Hello 你好", "zh"},
+		{"English sentence with Chinese greeting", "zh", "Hello how are you 你好", "en"},
+		{"Chinese sentence with English word", "en", "我想买 laptop", "zh"},
+		{"ambiguous acknowledgement", "zh", "好", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _ := DetectUtteranceLanguage(tt.label, tt.transcript, settings)
+			if got != tt.want {
+				t.Errorf("DetectUtteranceLanguage(%q, %q) = %q, want %q", tt.label, tt.transcript, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveReplyLanguageScenarios(t *testing.T) {
 	settings := VoiceLanguageSettings{
 		DefaultCode: "en",
@@ -153,4 +177,78 @@ func TestResolveReplyLanguageScenarios(t *testing.T) {
 	if !res.NoticeDue {
 		t.Fatalf("expected notice again in fresh session, got %+v", res)
 	}
+}
+
+func TestDefaultLanguagePreference(t *testing.T) {
+	mandarinDefault := VoiceLanguageSettings{
+		DefaultCode: "zh",
+		Languages: []VoiceLanguage{
+			{Code: "en", Name: "English", Voice: "af_heart"},
+			{Code: "zh", Name: "Mandarin Chinese", Voice: "zf_xiaoxiao"},
+			{Code: "yue", Name: "Cantonese", Voice: ""},
+			{Code: "ms", Name: "Malay", Voice: ""},
+		},
+	}
+
+	t.Run("undetermined initial utterance falls back to Mandarin default", func(t *testing.T) {
+		fresh := NewLanguageSessionState()
+		code, name := DetectUtteranceLanguage("en", "OK", mandarinDefault)
+		res := ResolveReplyLanguage(code, name, mandarinDefault, fresh)
+		if res.ReplyCode != "zh" || res.ReplyVoice != "zf_xiaoxiao" || res.Fallback {
+			t.Fatalf("expected zh fallback on fresh state, got %+v", res)
+		}
+	})
+
+	t.Run("undetermined mid-session utterance keeps previous English reply", func(t *testing.T) {
+		state := NewLanguageSessionState()
+		state.LastReplyCode = "en"
+		code, name := DetectUtteranceLanguage("en", "OK", mandarinDefault)
+		res := ResolveReplyLanguage(code, name, mandarinDefault, state)
+		if res.ReplyCode != "en" || res.ReplyVoice != "af_heart" || res.Fallback {
+			t.Fatalf("expected previous reply language en, got %+v", res)
+		}
+	})
+
+	t.Run("script-contradicting Han utterance resolves to Mandarin default", func(t *testing.T) {
+		got, _ := DetectUtteranceLanguage("en", "你好吗请问", mandarinDefault)
+		if got != "zh" {
+			t.Fatalf("expected zh, got %q", got)
+		}
+	})
+
+	cantoneseDefault := VoiceLanguageSettings{
+		DefaultCode: "yue",
+		Languages: []VoiceLanguage{
+			{Code: "en", Name: "English", Voice: "af_heart"},
+			{Code: "zh", Name: "Mandarin Chinese", Voice: "zf_xiaoxiao"},
+			{Code: "yue", Name: "Cantonese", Voice: "yue_voice"},
+		},
+	}
+
+	t.Run("Cantonese default preferred for Han script with missing or contradicting STT label", func(t *testing.T) {
+		for _, label := range []string{"", "en"} {
+			got, _ := DetectUtteranceLanguage(label, "你好嗎請問", cantoneseDefault)
+			if got != "yue" {
+				t.Fatalf("label %q: expected yue, got %q", label, got)
+			}
+		}
+	})
+
+	malayDefault := VoiceLanguageSettings{
+		DefaultCode: "ms",
+		Languages: []VoiceLanguage{
+			{Code: "en", Name: "English", Voice: "af_heart"},
+			{Code: "zh", Name: "Mandarin Chinese", Voice: "zf_xiaoxiao"},
+			{Code: "ms", Name: "Malay", Voice: "ms_voice"},
+		},
+	}
+
+	t.Run("Malay default preferred for Latin script with missing or contradicting STT label", func(t *testing.T) {
+		for _, label := range []string{"", "zh"} {
+			got, _ := DetectUtteranceLanguage(label, "Apa khabar hari ini", malayDefault)
+			if got != "ms" {
+				t.Fatalf("label %q: expected ms, got %q", label, got)
+			}
+		}
+	})
 }

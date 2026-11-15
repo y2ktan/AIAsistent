@@ -169,7 +169,7 @@ func NormalizeSTTLabel(label string, settings VoiceLanguageSettings) (code strin
 }
 
 func DetectDominantScript(text string) (script string, wordUnits int) {
-	var hanCount, latinLetters, otherLetters int
+	var hanCount, latinWords, otherWords int
 	inLatinWord := false
 	inOtherWord := false
 
@@ -181,15 +181,15 @@ func DetectDominantScript(text string) (script string, wordUnits int) {
 			inLatinWord = false
 			inOtherWord = false
 		case unicode.IsLetter(r) && unicode.Is(unicode.Latin, r):
-			latinLetters++
 			if !inLatinWord {
+				latinWords++
 				wordUnits++
 				inLatinWord = true
 			}
 			inOtherWord = false
 		case unicode.IsLetter(r):
-			otherLetters++
 			if !inOtherWord {
+				otherWords++
 				wordUnits++
 				inOtherWord = true
 			}
@@ -201,11 +201,11 @@ func DetectDominantScript(text string) (script string, wordUnits int) {
 	}
 
 	switch {
-	case hanCount > latinLetters && hanCount > otherLetters:
+	case hanCount > latinWords && hanCount > otherWords:
 		return "han", wordUnits
-	case latinLetters > hanCount && latinLetters > otherLetters:
+	case latinWords > hanCount && latinWords > otherWords:
 		return "latin", wordUnits
-	case otherLetters > hanCount && otherLetters > latinLetters:
+	case otherWords > hanCount && otherWords > latinWords:
 		return "other", wordUnits
 	default:
 		return "", wordUnits
@@ -227,7 +227,12 @@ func DetectUtteranceLanguage(sttLabel, transcript string, settings VoiceLanguage
 				return labelCode, labelName
 			}
 		}
-		// Script contradicts STT label (or no known label)
+		// Script contradicts STT label (or no known label): prefer configured default if it matches domScript.
+		if defLang, ok := settings.Find(settings.DefaultCode); ok {
+			if e, ok := LookupCatalogLanguage(defLang.Code); ok && e.Script == domScript {
+				return defLang.Code, defLang.Name
+			}
+		}
 		if domScript == "han" {
 			if _, ok := settings.Find("zh"); ok {
 				return "zh", "Mandarin Chinese"
