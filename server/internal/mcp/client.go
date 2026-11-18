@@ -27,14 +27,15 @@ type ToolDef struct {
 }
 
 type ServerConfig struct {
-	ID           string
-	Name         string
-	Transport    string
-	EndpointURL  string
-	AuthHeader   string
-	Enabled      bool
-	AllowedTools []string
-	TimeoutMs    int
+	ID              string
+	Name            string
+	Transport       string
+	EndpointURL     string
+	AuthHeader      string
+	Enabled         bool
+	AllowedTools    []string
+	DiscoveredTools []ToolDef
+	TimeoutMs       int
 }
 
 type Host struct {
@@ -74,7 +75,7 @@ func (h *Host) DiscoverTools(ctx context.Context, srv ServerConfig) ([]ToolDef, 
 		"method":  "tools/list",
 		"params":  map[string]any{},
 	}
-	raw, err := h.doJSONRPC(tCtx, srv, reqBody)
+	raw, err := h.doInitializedJSONRPC(tCtx, srv, reqBody)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +133,7 @@ func (h *Host) CallTool(ctx context.Context, srv ServerConfig, toolName string, 
 			"arguments": args,
 		},
 	}
-	raw, err := h.doJSONRPC(tCtx, srv, reqBody)
+	raw, err := h.doInitializedJSONRPC(tCtx, srv, reqBody)
 	if err != nil {
 		return "", err
 	}
@@ -170,30 +171,92 @@ func (h *Host) CallTool(ctx context.Context, srv ServerConfig, toolName string, 
 }
 
 func (h *Host) doJSONRPC(ctx context.Context, srv ServerConfig, payload map[string]any) ([]byte, error) {
+	raw, _, _, err := h.doJSONRPCResponse(ctx, srv, payload, "")
+	return raw, err
+}
+
+func (h *Host) doInitializedJSONRPC(ctx context.Context, srv ServerConfig, payload map[string]any) ([]byte, error) {
+	initialize := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "aegis-voice",
+				"version": "1.0.0",
+			},
+		},
+	}
+	raw, sessionID, status, err := h.doJSONRPCResponse(ctx, srv, initialize, "")
+	if err != nil {
+		if status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+			return h.doJSONRPC(ctx, srv, payload)
+		}
+		return nil, err
+	}
+
+	var response struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("decode initialize response: %w", err)
+	}
+	if response.Error != nil {
+		if response.Error.Code == -32601 {
+			return h.doJSONRPC(ctx, srv, payload)
+		}
+		return nil, fmt.Errorf("mcp initialize error (%d): %s", response.Error.Code, security.RedactString(response.Error.Message))
+	}
+	if len(response.Result) == 0 || bytes.Equal(response.Result, []byte("null")) {
+		return nil, errors.New("invalid mcp initialize response")
+	}
+
+	if sessionID != "" {
+		notification := map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "notifications/initialized",
+		}
+		_, _, _, _ = h.doJSONRPCResponse(ctx, srv, notification, sessionID)
+	}
+	result, _, _, err := h.doJSONRPCResponse(ctx, srv, payload, sessionID)
+	return result, err
+}
+
+func (h *Host) doJSONRPCResponse(ctx context.Context, srv ServerConfig, payload map[string]any, sessionID string) ([]byte, string, int, error) {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, "", 0, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.EndpointURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, err
+		return nil, "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
 	if srv.AuthHeader != "" {
 		req.Header.Set("Authorization", srv.AuthHeader)
 	}
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("mcp server returned status %d", resp.StatusCode)
+		return nil, resp.Header.Get("Mcp-Session-Id"), resp.StatusCode, fmt.Errorf("mcp server returned status %d", resp.StatusCode)
 	}
 
+	sessionID = resp.Header.Get("Mcp-Session-Id")
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if strings.Contains(ct, "text/event-stream") {
 		scanner := bufio.NewScanner(io.LimitReader(resp.Body, 4*1024*1024))
@@ -202,15 +265,16 @@ func (h *Host) doJSONRPC(ctx context.Context, srv ServerConfig, payload map[stri
 			if strings.HasPrefix(line, "data:") {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				if data != "" && data != "[DONE]" {
-					return []byte(data), nil
+					return []byte(data), sessionID, resp.StatusCode, nil
 				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			return nil, err
+			return nil, sessionID, resp.StatusCode, err
 		}
-		return nil, errors.New("empty SSE stream from mcp server")
+		return nil, sessionID, resp.StatusCode, errors.New("empty SSE stream from mcp server")
 	}
 
-	return io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	return raw, sessionID, resp.StatusCode, err
 }

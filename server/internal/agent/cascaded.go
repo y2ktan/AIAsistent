@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"aegis-voice/server/internal/mcp"
 	"aegis-voice/server/internal/rag"
 	"aegis-voice/server/internal/rtc"
 	"aegis-voice/server/internal/security"
@@ -36,7 +35,7 @@ type CascadedAdapter struct {
 
 func NewCascadedAdapter(deps Dependencies) *CascadedAdapter {
 	return &CascadedAdapter{
-		deps:       deps,
+		deps: deps,
 		// Generous timeout: self-hosted CPU models can take well over a minute on cold start.
 		httpClient: security.NewSafeHTTPClient(deps.Config.AllowPrivate, 180*time.Second),
 		langState:  NewLanguageSessionState(),
@@ -282,7 +281,7 @@ func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContex
 	}
 
 	messages := []map[string]any{
-		{"role": "system", "content": BuildSystemPrompt(c.deps.Config.SystemInstructions)},
+		{"role": "system", "content": BuildSystemPromptWithSkills(c.deps.Config.SystemInstructions, c.deps.Skills)},
 	}
 	if langInstruction != "" {
 		messages = append(messages, map[string]any{
@@ -313,24 +312,30 @@ func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContex
 		})
 	}
 
-	// Build tool definitions from enabled MCP servers
+	// Build tool definitions from enabled MCP servers.
 	var tools []map[string]any
-	toolToServer := make(map[string]mcp.ServerConfig)
-	for _, srv := range c.deps.MCPServers {
-		if !srv.Enabled {
-			continue
-		}
-		for _, tName := range srv.AllowedTools {
-			toolToServer[tName] = srv
-			tools = append(tools, map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        tName,
-					"description": "MCP tool from " + srv.Name,
-					"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
-				},
-			})
-		}
+	mcpTools := BuildMCPToolRegistry(c.deps.MCPServers)
+	toolToBinding := make(map[string]MCPToolBinding, len(mcpTools))
+	for _, tool := range mcpTools {
+		toolToBinding[tool.Name] = tool
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  tool.InputSchema,
+			},
+		})
+	}
+	for _, definition := range SkillToolDefinitions(c.deps.Skills) {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        definition.Name,
+				"description": definition.Description,
+				"parameters":  definition.Parameters,
+			},
+		})
 	}
 
 	model := c.deps.Config.LLMModel
@@ -338,7 +343,7 @@ func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContex
 		model = "gpt-4o"
 	}
 
-	for round := 0; round < 3; round++ {
+	for round := 0; round < maxToolRounds; round++ {
 		payload := map[string]any{
 			"model":    model,
 			"messages": messages,
@@ -420,17 +425,23 @@ func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContex
 				Timestamp: time.Now().UnixMilli(),
 			})
 			var toolOut string
-			if srv, ok := toolToServer[tc.Function.Name]; ok && c.deps.MCPHost != nil {
+			if binding, ok := toolToBinding[tc.Function.Name]; ok && c.deps.MCPHost != nil {
 				var args map[string]any
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
-				res, callErr := c.deps.MCPHost.CallTool(ctx, srv, tc.Function.Name, args)
+				res, callErr := c.deps.MCPHost.CallTool(ctx, binding.Server, binding.RawName, args)
 				if callErr != nil {
 					toolOut = "tool execution failed: " + security.RedactString(callErr.Error())
 				} else {
 					toolOut = WrapUntrustedToolOutput(tc.Function.Name, res)
 				}
 			} else {
-				toolOut = "tool not permitted"
+				var args map[string]any
+				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+				if skillOutput, handled := HandleSkillTool(c.deps.Skills, tc.Function.Name, args); handled {
+					toolOut = skillOutput
+				} else {
+					toolOut = "tool not permitted"
+				}
 			}
 			messages = append(messages, map[string]any{
 				"role":         "tool",

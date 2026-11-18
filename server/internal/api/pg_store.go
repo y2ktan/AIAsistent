@@ -10,6 +10,7 @@ import (
 
 	"aegis-voice/server/internal/agent"
 	"aegis-voice/server/internal/auth"
+	"aegis-voice/server/internal/skills"
 )
 
 type PGAdminStore struct {
@@ -255,6 +256,132 @@ func (s *PGAdminStore) UpsertMCPServer(ctx context.Context, rec *MCPServerRecord
 
 func (s *PGAdminStore) DeleteMCPServer(ctx context.Context, id string) error {
 	ct, err := s.pool.Exec(ctx, `DELETE FROM mcp_servers WHERE id = $1::uuid`, id)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+const agentSkillColumns = `
+	id::text, name, description, instructions, reference_files, allowed_tools,
+	source_format, filename, size_bytes, sha256_hash, enabled, uploaded_by::text,
+	created_at, updated_at
+`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAgentSkill(row rowScanner) (*skills.Skill, error) {
+	var skill skills.Skill
+	var referenceFilesJSON []byte
+	err := row.Scan(
+		&skill.ID, &skill.Name, &skill.Description, &skill.Instructions, &referenceFilesJSON,
+		&skill.AllowedTools, &skill.SourceFormat, &skill.Filename, &skill.SizeBytes,
+		&skill.SHA256Hash, &skill.Enabled, &skill.UploadedBy, &skill.CreatedAt, &skill.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(referenceFilesJSON, &skill.ReferenceFiles); err != nil {
+		return nil, err
+	}
+	if skill.ReferenceFiles == nil {
+		skill.ReferenceFiles = map[string]string{}
+	}
+	if skill.AllowedTools == nil {
+		skill.AllowedTools = []string{}
+	}
+	return &skill, nil
+}
+
+func (s *PGAdminStore) ListAgentSkills(ctx context.Context) ([]skills.Skill, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+agentSkillColumns+`
+		FROM agent_skills
+		ORDER BY created_at ASC, name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []skills.Skill
+	for rows.Next() {
+		skill, err := scanAgentSkill(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *skill)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGAdminStore) GetAgentSkill(ctx context.Context, id string) (*skills.Skill, error) {
+	skill, err := scanAgentSkill(s.pool.QueryRow(ctx, `
+		SELECT `+agentSkillColumns+`
+		FROM agent_skills
+		WHERE id = $1::uuid
+	`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return skill, err
+}
+
+func (s *PGAdminStore) UpsertAgentSkillByName(ctx context.Context, skill *skills.Skill) (*skills.Skill, error) {
+	referenceFilesJSON, err := json.Marshal(skill.ReferenceFiles)
+	if err != nil {
+		return nil, err
+	}
+	if skill.ReferenceFiles == nil {
+		referenceFilesJSON = []byte("{}")
+	}
+	allowedTools := skill.AllowedTools
+	if allowedTools == nil {
+		allowedTools = []string{}
+	}
+	return scanAgentSkill(s.pool.QueryRow(ctx, `
+		INSERT INTO agent_skills (
+			name, description, instructions, reference_files, allowed_tools,
+			source_format, filename, size_bytes, sha256_hash, uploaded_by
+		) VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::uuid)
+		ON CONFLICT (name) DO UPDATE SET
+			description = EXCLUDED.description,
+			instructions = EXCLUDED.instructions,
+			reference_files = EXCLUDED.reference_files,
+			allowed_tools = EXCLUDED.allowed_tools,
+			source_format = EXCLUDED.source_format,
+			filename = EXCLUDED.filename,
+			size_bytes = EXCLUDED.size_bytes,
+			sha256_hash = EXCLUDED.sha256_hash,
+			uploaded_by = EXCLUDED.uploaded_by,
+			updated_at = NOW()
+		RETURNING `+agentSkillColumns+`
+	`,
+		skill.Name, skill.Description, skill.Instructions, string(referenceFilesJSON), allowedTools,
+		skill.SourceFormat, skill.Filename, skill.SizeBytes, skill.SHA256Hash, skill.UploadedBy,
+	))
+}
+
+func (s *PGAdminStore) UpdateAgentSkillEnabled(ctx context.Context, id string, enabled bool) (*skills.Skill, error) {
+	skill, err := scanAgentSkill(s.pool.QueryRow(ctx, `
+		UPDATE agent_skills
+		SET enabled = $2, updated_at = NOW()
+		WHERE id = $1::uuid
+		RETURNING `+agentSkillColumns+`
+	`, id, enabled))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return skill, err
+}
+
+func (s *PGAdminStore) DeleteAgentSkill(ctx context.Context, id string) error {
+	ct, err := s.pool.Exec(ctx, `DELETE FROM agent_skills WHERE id = $1::uuid`, id)
 	if err != nil {
 		return err
 	}

@@ -8,6 +8,7 @@ import (
 	"aegis-voice/server/internal/agent"
 	"aegis-voice/server/internal/auth"
 	"aegis-voice/server/internal/mcp"
+	"aegis-voice/server/internal/skills"
 )
 
 var (
@@ -79,5 +80,10 @@ type AdminStore interface {
 	GetMCPServer(ctx context.Context, id string) (*MCPServerRecord, error)
 	UpsertMCPServer(ctx context.Context, rec *MCPServerRecord) (*MCPServerRecord, error)
 	DeleteMCPServer(ctx context.Context, id string) error
+	ListAgentSkills(ctx context.Context) ([]skills.Skill, error)
+	GetAgentSkill(ctx context.Context, id string) (*skills.Skill, error)
+	UpsertAgentSkillByName(ctx context.Context, skill *skills.Skill) (*skills.Skill, error)
+	UpdateAgentSkillEnabled(ctx context.Context, id string, enabled bool) (*skills.Skill, error)
+	DeleteAgentSkill(ctx context.Context, id string) error
 	ListAuditLogs(ctx context.Context, limit, offset int) ([]AuditLogRecord, error)
 }

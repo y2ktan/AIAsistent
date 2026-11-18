@@ -1,0 +1,40 @@
+# Spec Delta
+
+## MODIFIED Requirements
+
+### Requirement: Dual-mode spoken and visual question answering
+The system SHALL support both native real-time multimodal streaming endpoints and a modular speech-to-text, vision/chat language model, and streaming text-to-speech pipeline based on active administrator configuration, orchestrating enabled Agent Skills alongside RAG context and MCP tools in both modes.
+
+#### Scenario: Realtime multimodal mode processes speech and camera context
+- **WHEN** the active agent mode is set to `realtime` and the user asks a spoken question with the camera enabled
+- **THEN** the system streams user audio and sampled video frames to the configured realtime endpoint, exposes enabled Agent Skills and permitted MCP tools, and returns synthesized spoken audio plus transcript
+
+#### Scenario: Modular OpenAI-compatible mode answers spoken question
+- **WHEN** the active agent mode is set to `cascaded` against an OpenAI-compatible endpoint and the user finishes an utterance
+- **THEN** the system transcribes the speech, evaluates the query with any active camera frame, RAG context, enabled Agent Skills, and MCP tools across multi-step tool rounds, and streams synthesized speech back to the user
+
+### Requirement: Model Context Protocol (MCP) tool discovery and execution
+The system SHALL connect to administrator-enabled MCP servers (negotiating Streamable HTTP initialization when required), expose their permitted tools with discovered descriptions and JSON input schemas to the active conversational agent, disambiguate colliding tool names across servers, and enforce execution timeouts on tool calls.
+
+#### Scenario: Assistant invokes an enabled MCP tool during conversation
+- **WHEN** answering a user utterance requires data from a configured and enabled MCP server
+- **THEN** the system exposes the tool's discovered description and parameter schema to the LLM, executes the MCP tool call within a bounded timeout, emits a tool-activity indicator, and incorporates the sanitized result into the spoken reply
+
+#### Scenario: Streamable HTTP MCP server requires protocol initialization
+- **WHEN** an enabled MCP server requires an MCP `initialize` handshake and `Mcp-Session-Id` header before `tools/list` or `tools/call`
+- **THEN** the MCP client negotiates session initialization and forwards the session header while remaining compatible with stateless JSON-RPC MCP endpoints
+
+#### Scenario: Multiple enabled MCP servers expose a same-named tool
+- **WHEN** two enabled MCP servers both allow a tool with the same raw name (such as `search`)
+- **THEN** the agent exposes distinct disambiguated function names to the LLM and routes each invocation back to its originating MCP server and raw tool name
+
+### Requirement: Prompt-injection isolation and output guardrails
+The system SHALL subordinate administrator-uploaded Agent Skill instructions strictly beneath immutable system security boundary rules, isolate untrusted retrieved document text and external MCP tool outputs from system instructions, and prevent disclosure of system secrets or internal configurations.
+
+#### Scenario: Ingested document or spoken input contains prompt-injection instructions
+- **WHEN** a retrieved passage, external MCP tool output, or spoken utterance instructs the assistant to reveal API keys, system prompts, or bypass role rules
+- **THEN** the system treats external data strictly as untrusted content and refuses to disclose secrets or execute unauthorized actions
+
+#### Scenario: Skill playbook cannot override secret protection or MCP allowlists
+- **WHEN** an active Agent Skill references an unpermitted MCP tool or contains text conflicting with the system security boundary preamble
+- **THEN** the system enforces the security boundary preamble above skill content, blocks calls to unpermitted MCP tools, and redacts secrets from assistant output

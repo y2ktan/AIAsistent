@@ -415,3 +415,491 @@ func TestCascadedMultilingualRoutingNoticeAndVoiceGuard(t *testing.T) {
 		t.Fatalf("turn 4 expected zf_xiaoxiao, got %s", ttsVoices[4])
 	}
 }
+
+func TestSkillsProgressiveDisclosureAndUnavailableSkills(t *testing.T) {
+	skills := []AgentSkill{
+		{Name: "weather", Description: "Weather workflow", Enabled: true, Instructions: "Check current conditions.", ReferenceFiles: map[string]string{"refs/guide.md": "Use Celsius."}},
+		{Name: "disabled", Description: "Hidden workflow", Enabled: false, Instructions: "Must not be exposed."},
+	}
+
+	catalog := BuildSystemPromptWithSkills("System instructions", skills)
+	if !strings.Contains(catalog, "<available_skills>") ||
+		!strings.Contains(catalog, "weather") ||
+		strings.Contains(catalog, "Hidden workflow") ||
+		strings.Index(catalog, "SECURITY BOUNDARY RULES") > strings.Index(catalog, "<available_skills>") {
+		t.Fatalf("unexpected skill catalog hierarchy: %s", catalog)
+	}
+
+	if output, handled := HandleSkillTool(skills, "load_skill", map[string]any{"name": "disabled"}); !handled || output != "skill not available" {
+		t.Fatalf("disabled skill load = (%q, %v), want safe unavailable response", output, handled)
+	}
+	if output, handled := HandleSkillTool(skills, "load_skill", map[string]any{"name": "missing"}); !handled || output != "skill not available" {
+		t.Fatalf("unknown skill load = (%q, %v), want safe unavailable response", output, handled)
+	}
+	if output, handled := HandleSkillTool(skills, "read_skill_file", map[string]any{"skill": "weather", "path": "../secret"}); !handled || output != "skill reference file not available" {
+		t.Fatalf("traversal reference read = (%q, %v), want safe unavailable response", output, handled)
+	}
+}
+
+type agentMCPCall struct {
+	ServerName string
+	ToolName   string
+	Arguments  map[string]any
+}
+
+func newAgentMCPTestServer(t *testing.T, serverName string, calls chan<- agentMCPCall) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			Params struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode MCP request: %v", err)
+			return
+		}
+		switch req.Method {
+		case "initialize":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}`))
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			calls <- agentMCPCall{ServerName: serverName, ToolName: req.Params.Name, Arguments: req.Params.Arguments}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      1,
+				"result": map[string]any{
+					"content": []map[string]string{{"type": "text", "text": "forecast from " + serverName}},
+				},
+			})
+		default:
+			t.Errorf("unexpected MCP method %q", req.Method)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+}
+
+func TestCascadedSkillAndMCPToolOrchestration(t *testing.T) {
+	mcpCalls := make(chan agentMCPCall, 2)
+	mcpServer := newAgentMCPTestServer(t, "weather-service", mcpCalls)
+	defer mcpServer.Close()
+
+	skill := AgentSkill{
+		Name:           "weather",
+		Description:    "Get a weather forecast.",
+		Instructions:   "Use the forecast tool with the requested city, then summarize the result.",
+		ReferenceFiles: map[string]string{"references/units.md": "Return temperatures in Celsius."},
+		Enabled:        true,
+	}
+	var llmRequests int
+	var sawInstructions, sawReference bool
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Tools []struct {
+				Function struct {
+					Name        string         `json:"name"`
+					Description string         `json:"description"`
+					Parameters  map[string]any `json:"parameters"`
+				} `json:"function"`
+			} `json:"tools"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode chat request: %v", err)
+			return
+		}
+		for _, message := range req.Messages {
+			if strings.Contains(message.Content, "Use the forecast tool") {
+				sawInstructions = true
+			}
+			if strings.Contains(message.Content, "Return temperatures in Celsius") {
+				sawReference = true
+			}
+		}
+		var weatherSchema map[string]any
+		for _, tool := range req.Tools {
+			if tool.Function.Name == "get_weather" {
+				if tool.Function.Description != "Get current forecast" {
+					t.Errorf("MCP description = %q", tool.Function.Description)
+				}
+				weatherSchema = tool.Function.Parameters
+			}
+		}
+		if weatherSchema == nil {
+			t.Errorf("get_weather schema missing from tool definitions")
+		} else {
+			properties, _ := weatherSchema["properties"].(map[string]any)
+			citySchema, _ := properties["city"].(map[string]any)
+			if citySchema["type"] != "string" || weatherSchema["required"] == nil {
+				t.Errorf("unexpected get_weather schema: %#v", weatherSchema)
+			}
+		}
+
+		responses := []map[string]any{
+			{"tool_calls": []map[string]any{{"id": "load-1", "type": "function", "function": map[string]string{"name": "load_skill", "arguments": `{"name":"weather"}`}}}},
+			{"tool_calls": []map[string]any{{"id": "read-1", "type": "function", "function": map[string]string{"name": "read_skill_file", "arguments": `{"skill":"weather","path":"references/units.md"}`}}}},
+			{"tool_calls": []map[string]any{{"id": "weather-1", "type": "function", "function": map[string]string{"name": "get_weather", "arguments": `{"city":"Tokyo"}`}}}},
+			{"content": "Tokyo is sunny. Temperatures are in Celsius."},
+		}
+		if llmRequests >= len(responses) {
+			t.Errorf("unexpected extra LLM request")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		response := responses[llmRequests]
+		llmRequests++
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": response}}})
+	}))
+	defer llmServer.Close()
+
+	adapter := NewCascadedAdapter(Dependencies{
+		Config:  AgentConfig{LLMBaseURL: llmServer.URL, AllowPrivate: true},
+		Sink:    &mockSink{},
+		MCPHost: mcp.NewHost(true),
+		MCPServers: []mcp.ServerConfig{{
+			ID: "weather-id", Name: "Weather Service", EndpointURL: mcpServer.URL, Enabled: true, AllowedTools: []string{"get_weather"},
+			DiscoveredTools: []mcp.ToolDef{{
+				Name: "get_weather", Description: "Get current forecast",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}, "required": []any{"city"}},
+			}},
+		}},
+		Skills: []AgentSkill{skill},
+	})
+
+	reply, err := adapter.chatWithTools(context.Background(), "Weather in Tokyo?", "", nil, "")
+	if err != nil {
+		t.Fatalf("chatWithTools failed: %v", err)
+	}
+	if reply != "Tokyo is sunny. Temperatures are in Celsius." || llmRequests != 4 {
+		t.Fatalf("reply = %q, LLM requests = %d", reply, llmRequests)
+	}
+	if !sawInstructions || !sawReference {
+		t.Fatalf("LLM did not receive both loaded skill instructions and reference file")
+	}
+	select {
+	case call := <-mcpCalls:
+		if call.ToolName != "get_weather" || call.Arguments["city"] != "Tokyo" {
+			t.Fatalf("unexpected MCP call: %+v", call)
+		}
+	default:
+		t.Fatal("expected MCP call")
+	}
+}
+
+func TestMCPToolRegistryDisambiguatesAndPreservesMetadata(t *testing.T) {
+	servers := []mcp.ServerConfig{
+		{ID: "crm-id", Name: "CRM", Enabled: true, AllowedTools: []string{"lookup", "load_skill"}, DiscoveredTools: []mcp.ToolDef{
+			{Name: "lookup", Description: "Lookup CRM records", InputSchema: map[string]any{"type": "object"}},
+		}},
+		{ID: "finance-id", Name: "Finance", Enabled: true, AllowedTools: []string{"lookup"}, DiscoveredTools: []mcp.ToolDef{
+			{Name: "lookup", Description: "Lookup finance records", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"account": map[string]any{"type": "string"}}}},
+		}},
+		{ID: "disabled-id", Name: "Disabled", Enabled: false, AllowedTools: []string{"disabled_tool"}},
+	}
+	registry := BuildMCPToolRegistry(servers)
+	got := make(map[string]MCPToolBinding, len(registry))
+	for _, binding := range registry {
+		got[binding.Name] = binding
+	}
+	for _, name := range []string{"crm__lookup", "finance__lookup", "crm__load_skill"} {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("registry missing %q: %#v", name, got)
+		}
+	}
+	if len(registry) != 3 {
+		t.Fatalf("registry exposed %d tools, want 3", len(registry))
+	}
+	if got["crm__lookup"].Description != "Lookup CRM records" || got["crm__lookup"].RawName != "lookup" || got["crm__lookup"].Server.ID != "crm-id" {
+		t.Fatalf("CRM route or metadata incorrect: %+v", got["crm__lookup"])
+	}
+	if got["finance__lookup"].Description != "Lookup finance records" || got["finance__lookup"].Server.ID != "finance-id" {
+		t.Fatalf("Finance route or metadata incorrect: %+v", got["finance__lookup"])
+	}
+	if _, ok := got["disabled_tool"]; ok {
+		t.Fatal("disabled MCP server tool was exposed")
+	}
+	properties, _ := got["crm__lookup"].InputSchema["properties"].(map[string]any)
+	if properties == nil {
+		t.Fatalf("object schema missing properties: %#v", got["crm__lookup"].InputSchema)
+	}
+}
+
+func TestCascadedRoutesDuplicateMCPToolNames(t *testing.T) {
+	mcpCalls := make(chan agentMCPCall, 2)
+	crmServer := newAgentMCPTestServer(t, "crm", mcpCalls)
+	defer crmServer.Close()
+	financeServer := newAgentMCPTestServer(t, "finance", mcpCalls)
+	defer financeServer.Close()
+
+	var llmRequests int
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode chat request: %v", err)
+			return
+		}
+		names := make(map[string]bool)
+		for _, tool := range req.Tools {
+			names[tool.Function.Name] = true
+		}
+		if !names["crm__lookup"] || !names["finance__lookup"] {
+			t.Errorf("duplicate MCP tools were not disambiguated: %v", names)
+		}
+
+		switch llmRequests {
+		case 0:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{
+				"tool_calls": []map[string]any{{"id": "crm-1", "type": "function", "function": map[string]string{"name": "crm__lookup", "arguments": `{"query":"customer"}`}}},
+			}}}})
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{
+				"tool_calls": []map[string]any{{"id": "finance-1", "type": "function", "function": map[string]string{"name": "finance__lookup", "arguments": `{"query":"invoice"}`}}},
+			}}}})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]string{"content": "Both records were found."}}}})
+		}
+		llmRequests++
+	}))
+	defer llmServer.Close()
+
+	adapter := NewCascadedAdapter(Dependencies{
+		Config:  AgentConfig{LLMBaseURL: llmServer.URL, AllowPrivate: true},
+		Sink:    &mockSink{},
+		MCPHost: mcp.NewHost(true),
+		MCPServers: []mcp.ServerConfig{
+			{ID: "crm-id", Name: "CRM", EndpointURL: crmServer.URL, Enabled: true, AllowedTools: []string{"lookup"}, DiscoveredTools: []mcp.ToolDef{{Name: "lookup", InputSchema: map[string]any{"type": "object"}}}},
+			{ID: "finance-id", Name: "Finance", EndpointURL: financeServer.URL, Enabled: true, AllowedTools: []string{"lookup"}, DiscoveredTools: []mcp.ToolDef{{Name: "lookup", InputSchema: map[string]any{"type": "object"}}}},
+		},
+	})
+	reply, err := adapter.chatWithTools(context.Background(), "Find the customer and invoice.", "", nil, "")
+	if err != nil || reply != "Both records were found." {
+		t.Fatalf("reply = %q, error = %v", reply, err)
+	}
+
+	routed := map[string]string{}
+	for range 2 {
+		select {
+		case call := <-mcpCalls:
+			routed[call.Arguments["query"].(string)] = call.ServerName
+			if call.ToolName != "lookup" {
+				t.Fatalf("MCP received exposed name instead of raw name: %+v", call)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for duplicate-name MCP calls")
+		}
+	}
+	if routed["customer"] != "crm" || routed["invoice"] != "finance" {
+		t.Fatalf("duplicate MCP calls routed incorrectly: %v", routed)
+	}
+}
+
+func TestRealtimeSkillAndMCPToolOrchestration(t *testing.T) {
+	mcpCalls := make(chan agentMCPCall, 1)
+	mcpServer := newAgentMCPTestServer(t, "weather-service", mcpCalls)
+	defer mcpServer.Close()
+
+	skill := AgentSkill{
+		Name:           "weather",
+		Description:    "Get a weather forecast.",
+		Instructions:   "Use get_weather to answer.",
+		ReferenceFiles: map[string]string{"references/units.md": "Use Celsius."},
+		Enabled:        true,
+	}
+	upgrader := websocket.Upgrader{}
+	serverDone := make(chan struct{})
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(serverDone)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		var session map[string]any
+		if err := conn.ReadJSON(&session); err != nil {
+			t.Errorf("read session update: %v", err)
+			return
+		}
+		rawSession, _ := json.Marshal(session)
+		for _, expected := range []string{"Get current forecast", "available_skills", "get_weather"} {
+			if !strings.Contains(string(rawSession), expected) {
+				t.Errorf("session update omitted %q: %s", expected, rawSession)
+			}
+		}
+
+		toolCalls := []struct {
+			callID string
+			name   string
+			args   string
+		}{
+			{"load-1", "load_skill", `{"name":"weather"}`},
+			{"read-1", "read_skill_file", `{"skill":"weather","path":"references/units.md"}`},
+			{"weather-1", "get_weather", `{"city":"Tokyo"}`},
+		}
+		for _, toolCall := range toolCalls {
+			if err := conn.WriteJSON(map[string]any{
+				"type":      "response.function_call_arguments.done",
+				"call_id":   toolCall.callID,
+				"name":      toolCall.name,
+				"arguments": toolCall.args,
+			}); err != nil {
+				t.Errorf("send tool call: %v", err)
+				return
+			}
+			var output map[string]any
+			if err := conn.ReadJSON(&output); err != nil {
+				t.Errorf("read tool output: %v", err)
+				return
+			}
+			if output["type"] != "conversation.item.create" {
+				t.Errorf("unexpected tool output event: %#v", output)
+				return
+			}
+			item, _ := output["item"].(map[string]any)
+			outputText, _ := item["output"].(string)
+			switch toolCall.name {
+			case "load_skill":
+				if !strings.Contains(outputText, "Use get_weather to answer") {
+					t.Errorf("load_skill output missing instructions: %s", outputText)
+				}
+			case "read_skill_file":
+				if !strings.Contains(outputText, "Use Celsius.") {
+					t.Errorf("read_skill_file output missing reference: %s", outputText)
+				}
+			case "get_weather":
+				if !strings.Contains(outputText, "forecast from weather-service") {
+					t.Errorf("MCP output missing forecast: %s", outputText)
+				}
+			}
+			var responseCreate map[string]any
+			if err := conn.ReadJSON(&responseCreate); err != nil || responseCreate["type"] != "response.create" {
+				t.Errorf("expected response.create after tool output, got %#v err=%v", responseCreate, err)
+				return
+			}
+		}
+		_ = conn.WriteJSON(map[string]any{
+			"type":  "response.audio_transcript.delta",
+			"delta": "Secret: realtime-secret-123456",
+		})
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer wsServer.Close()
+
+	sink := &mockSink{}
+	adapter := NewRealtimeAdapter(Dependencies{
+		Config:  AgentConfig{Mode: "realtime", RealtimeWSURL: wsServer.URL, APIKey: "realtime-secret-123456", AllowPrivate: true},
+		Sink:    sink,
+		MCPHost: mcp.NewHost(true),
+		MCPServers: []mcp.ServerConfig{{
+			ID: "weather-id", Name: "Weather Service", EndpointURL: mcpServer.URL, Enabled: true, AllowedTools: []string{"get_weather"},
+			DiscoveredTools: []mcp.ToolDef{{
+				Name: "get_weather", Description: "Get current forecast",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+			}},
+		}},
+		Skills: []AgentSkill{skill},
+	})
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("Realtime Start failed: %v", err)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for realtime orchestration")
+	}
+	_ = adapter.Close()
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	foundTranscript := false
+	for _, event := range sink.events {
+		if event.Type == "transcript.delta" {
+			foundTranscript = true
+			if strings.Contains(event.Text, "realtime-secret-123456") || !strings.Contains(event.Text, "[REDACTED]") {
+				t.Fatalf("realtime transcript was not redacted: %q", event.Text)
+			}
+		}
+	}
+	if !foundTranscript {
+		t.Fatal("expected synthesized realtime transcript")
+	}
+	select {
+	case call := <-mcpCalls:
+		if call.ToolName != "get_weather" || call.Arguments["city"] != "Tokyo" {
+			t.Fatalf("unexpected realtime MCP call: %+v", call)
+		}
+	default:
+		t.Fatal("expected realtime MCP call")
+	}
+}
+
+func TestCascadedBlocksUnpermittedToolAndRealtimeToolBudget(t *testing.T) {
+	var llmRequests int
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if llmRequests == 0 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{
+				"tool_calls": []map[string]any{{"id": "bad-1", "type": "function", "function": map[string]string{"name": "delete_db", "arguments": `{}`}}},
+			}}}})
+		} else {
+			foundDenied := false
+			for _, message := range req.Messages {
+				if message.Role == "tool" && message.Content == "tool not permitted" {
+					foundDenied = true
+				}
+			}
+			if !foundDenied {
+				t.Errorf("unpermitted tool result missing from conversation")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]string{"content": "I cannot do that."}}}})
+		}
+		llmRequests++
+	}))
+	defer llmServer.Close()
+
+	adapter := NewCascadedAdapter(Dependencies{
+		Config: AgentConfig{LLMBaseURL: llmServer.URL, AllowPrivate: true},
+		Sink:   &mockSink{},
+		MCPServers: []mcp.ServerConfig{{
+			ID: "safe-id", Name: "Safe", Enabled: true, AllowedTools: []string{"read_only"},
+		}},
+		MCPHost: mcp.NewHost(true),
+	})
+	reply, err := adapter.chatWithTools(context.Background(), "delete database", "", nil, "")
+	if err != nil || reply != "I cannot do that." {
+		t.Fatalf("reply = %q, error = %v", reply, err)
+	}
+
+	realtime := NewRealtimeAdapter(Dependencies{Sink: &mockSink{}})
+	for call := 0; call < maxToolRounds; call++ {
+		if !realtime.reserveToolCall() {
+			t.Fatalf("tool call %d was rejected before budget was exhausted", call+1)
+		}
+	}
+	if realtime.reserveToolCall() {
+		t.Fatal("realtime adapter accepted a tool call beyond the six-call budget")
+	}
+	realtime.resetToolCallBudget()
+	if !realtime.reserveToolCall() {
+		t.Fatal("realtime tool-call budget did not reset for a new utterance")
+	}
+}

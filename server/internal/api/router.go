@@ -73,6 +73,13 @@ func (s *Server) Router() http.Handler {
 	)
 	mux.Handle("DELETE /api/v1/admin/documents/{id}", admin(s.HandleDeleteDocument))
 
+	mux.Handle("GET /api/v1/admin/skills", admin(s.HandleListAgentSkills))
+	mux.Handle("POST /api/v1/admin/skills",
+		auth.RateLimitMiddleware(uploadLimiter, auth.ClientIP)(admin(s.HandleUploadAgentSkill)),
+	)
+	mux.Handle("PATCH /api/v1/admin/skills/{id}", admin(s.HandleUpdateAgentSkill))
+	mux.Handle("DELETE /api/v1/admin/skills/{id}", admin(s.HandleDeleteAgentSkill))
+
 	mux.Handle("GET /api/v1/admin/agent-config", admin(s.HandleGetAgentConfig))
 	mux.Handle("PUT /api/v1/admin/agent-config", admin(s.HandleUpdateAgentConfig))
 	mux.Handle("POST /api/v1/admin/agent-config/test", admin(s.HandleTestAgentConfig))

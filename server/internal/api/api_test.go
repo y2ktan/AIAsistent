@@ -1,9 +1,11 @@
 package api
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"aegis-voice/server/internal/rag"
 	"aegis-voice/server/internal/rtc"
 	"aegis-voice/server/internal/security"
+	"aegis-voice/server/internal/skills"
 )
 
 type mockAllStore struct {
@@ -27,6 +30,7 @@ type mockAllStore struct {
 	agentCfg        *AgentConfigRecord
 	voiceLangs      *agent.VoiceLanguageSettings
 	mcpServers      map[string]*MCPServerRecord
+	agentSkills     map[string]*skills.Skill
 	audits          []AuditLogRecord
 	seq             int
 }
@@ -37,6 +41,7 @@ func newMockAllStore() *mockAllStore {
 		sessions:        make(map[string]*auth.Session),
 		signalingTokens: make(map[string]*auth.SignalingToken),
 		mcpServers:      make(map[string]*MCPServerRecord),
+		agentSkills:     make(map[string]*skills.Skill),
 		agentCfg:        &AgentConfigRecord{Name: "default", Mode: "cascaded"},
 	}
 }
@@ -232,10 +237,279 @@ func (m *mockAllStore) UpsertMCPServer(_ context.Context, rec *MCPServerRecord) 
 	return rec, nil
 }
 func (m *mockAllStore) DeleteMCPServer(_ context.Context, _ string) error { return nil }
+func cloneTestSkill(skill *skills.Skill) *skills.Skill {
+	cp := *skill
+	cp.AllowedTools = append([]string(nil), skill.AllowedTools...)
+	cp.ReferenceFiles = make(map[string]string, len(skill.ReferenceFiles))
+	for name, content := range skill.ReferenceFiles {
+		cp.ReferenceFiles[name] = content
+	}
+	if skill.UploadedBy != nil {
+		uploadedBy := *skill.UploadedBy
+		cp.UploadedBy = &uploadedBy
+	}
+	return &cp
+}
+
+func (m *mockAllStore) ListAgentSkills(_ context.Context) ([]skills.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]skills.Skill, 0, len(m.agentSkills))
+	for _, skill := range m.agentSkills {
+		out = append(out, *cloneTestSkill(skill))
+	}
+	return out, nil
+}
+
+func (m *mockAllStore) GetAgentSkill(_ context.Context, id string) (*skills.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, skill := range m.agentSkills {
+		if skill.ID == id {
+			return cloneTestSkill(skill), nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *mockAllStore) UpsertAgentSkillByName(_ context.Context, skill *skills.Skill) (*skills.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.agentSkills {
+		if existing.Name == skill.Name {
+			skill.ID = existing.ID
+			skill.Enabled = existing.Enabled
+			skill.CreatedAt = existing.CreatedAt
+			skill.UpdatedAt = time.Now()
+			m.agentSkills[skill.ID] = cloneTestSkill(skill)
+			return cloneTestSkill(skill), nil
+		}
+	}
+	m.seq++
+	if skill.ID == "" {
+		skill.ID = "skill-" + string(rune('0'+m.seq))
+	}
+	if skill.CreatedAt.IsZero() {
+		skill.CreatedAt = time.Now()
+	}
+	skill.UpdatedAt = skill.CreatedAt
+	m.agentSkills[skill.ID] = cloneTestSkill(skill)
+	return cloneTestSkill(skill), nil
+}
+
+func (m *mockAllStore) UpdateAgentSkillEnabled(_ context.Context, id string, enabled bool) (*skills.Skill, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	skill, ok := m.agentSkills[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	skill.Enabled = enabled
+	skill.UpdatedAt = time.Now()
+	return cloneTestSkill(skill), nil
+}
+
+func (m *mockAllStore) DeleteAgentSkill(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.agentSkills[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.agentSkills, id)
+	return nil
+}
+
 func (m *mockAllStore) ListAuditLogs(_ context.Context, _, _ int) ([]AuditLogRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]AuditLogRecord(nil), m.audits...), nil
+}
+
+func createAgentSkillUploadRequest(t *testing.T, filename string, content []byte) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/skills", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
+
+func createAgentSkillZip(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var body bytes.Buffer
+	writer := zip.NewWriter(&body)
+	for filename, content := range files {
+		entry, err := writer.Create(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return body.Bytes()
+}
+
+func TestAgentSkillsAdminAPI(t *testing.T) {
+	store := newMockAllStore()
+	vault, err := security.NewVault(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authSvc := auth.NewService(store, auth.Config{
+		WebOrigin:           "https://aegis.local",
+		AdminBootstrapToken: "boot-123",
+	}, nil)
+	rtcMgr, err := rtc.NewManager(rtc.Config{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rtcMgr.Close()
+
+	router := NewServer(authSvc, store, store, rag.NewService(nil, 0), rtcMgr, mcp.NewHost(false), vault, false, nil).Router()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/bootstrap", bytes.NewBufferString(`{"bootstrapToken":"boot-123","email":"admin@aegis.local","password":"AdminPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("bootstrap failed: %d %s", rec.Code, rec.Body.String())
+	}
+	adminCookie := rec.Result().Cookies()[0]
+	var bootstrap struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+
+	sendAdmin := func(req *http.Request, includeCSRF bool) *httptest.ResponseRecorder {
+		req.AddCookie(adminCookie)
+		req.Header.Set("Origin", "https://aegis.local")
+		if includeCSRF {
+			req.Header.Set("X-CSRF-Token", bootstrap.CSRFToken)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	markdown := []byte("---\nname: Weekly Report\ndescription: Summarize weekly reports.\nallowed-tools: reports__list\n---\n\nRead and summarize the latest report.\n")
+	rec = sendAdmin(createAgentSkillUploadRequest(t, "weekly-report.md", markdown), true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("Markdown upload failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var firstUpload struct {
+		Skill adminAgentSkillResponse `json:"skill"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &firstUpload); err != nil {
+		t.Fatal(err)
+	}
+	if firstUpload.Skill.Name != "weekly-report" || firstUpload.Skill.SourceFormat != "md" || firstUpload.Skill.Enabled != true {
+		t.Fatalf("unexpected Markdown upload response: %+v", firstUpload.Skill)
+	}
+	skillID := firstUpload.Skill.ID
+
+	rec = sendAdmin(httptest.NewRequest(http.MethodPatch, "/api/v1/admin/skills/"+skillID, bytes.NewBufferString(`{"enabled":false}`)), true)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":false`) {
+		t.Fatalf("disable skill failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	zipData := createAgentSkillZip(t, map[string]string{
+		"weekly/SKILL.md":            "---\nname: weekly-report\ndescription: Updated weekly report workflow.\n---\n\nUse the report reference and summarize changes.\n",
+		"weekly/references/guide.md": "Internal reference content must not be exposed by list API.",
+	})
+	rec = sendAdmin(createAgentSkillUploadRequest(t, "weekly-report.zip", zipData), true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("ZIP re-upload failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var secondUpload struct {
+		Skill adminAgentSkillResponse `json:"skill"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &secondUpload); err != nil {
+		t.Fatal(err)
+	}
+	if secondUpload.Skill.ID != skillID || secondUpload.Skill.Enabled || secondUpload.Skill.SourceFormat != "zip" {
+		t.Fatalf("re-upload did not preserve identifier/disabled state: %+v", secondUpload.Skill)
+	}
+	if secondUpload.Skill.Description != "Updated weekly report workflow." ||
+		len(secondUpload.Skill.ReferenceFilePaths) != 1 ||
+		secondUpload.Skill.ReferenceFilePaths[0] != "references/guide.md" {
+		t.Fatalf("ZIP skill metadata not updated: %+v", secondUpload.Skill)
+	}
+
+	rec = sendAdmin(createAgentSkillUploadRequest(t, "invalid.md", []byte("# missing frontmatter\n")), true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid upload status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = sendAdmin(httptest.NewRequest(http.MethodGet, "/api/v1/admin/skills", nil), false)
+	if rec.Code != http.StatusOK ||
+		!strings.Contains(rec.Body.String(), "Use the report reference") ||
+		!strings.Contains(rec.Body.String(), "references/guide.md") ||
+		strings.Contains(rec.Body.String(), "Internal reference content") {
+		t.Fatalf("unexpected skills list response: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = sendAdmin(httptest.NewRequest(http.MethodPatch, "/api/v1/admin/skills/"+skillID, bytes.NewBufferString(`{"enabled":true}`)), true)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":true`) {
+		t.Fatalf("enable skill failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026","role":"user"}`))
+	rec = sendAdmin(req, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create regular user failed: %d %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("regular user login failed: %d %s", rec.Code, rec.Body.String())
+	}
+	userCookie := rec.Result().Cookies()[0]
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/admin/skills", nil)
+	req.AddCookie(userCookie)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin skills access status = %d, want 403", rec.Code)
+	}
+
+	rec = sendAdmin(httptest.NewRequest(http.MethodPatch, "/api/v1/admin/skills/"+skillID, bytes.NewBufferString(`{"enabled":false}`)), false)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF token status = %d, want 403", rec.Code)
+	}
+
+	rec = sendAdmin(httptest.NewRequest(http.MethodDelete, "/api/v1/admin/skills/"+skillID, nil), true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete skill failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = sendAdmin(httptest.NewRequest(http.MethodGet, "/api/v1/admin/skills", nil), false)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"skills":[]`) {
+		t.Fatalf("deleted skill remained in list: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = sendAdmin(httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit-logs", nil), false)
+	for _, action := range []string{"admin.skill.upload", "admin.skill.update", "admin.skill.delete"} {
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), action) {
+			t.Fatalf("audit log missing %q: %d %s", action, rec.Code, rec.Body.String())
+		}
+	}
 }
 
 func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {

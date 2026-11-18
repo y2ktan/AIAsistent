@@ -49,4 +49,5 @@ type Dependencies struct {
 	Embedder   rag.Embedder
 	MCPHost    *mcp.Host
 	MCPServers []mcp.ServerConfig
+	Skills     []AgentSkill
 }

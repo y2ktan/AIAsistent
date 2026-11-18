@@ -7,13 +7,32 @@ Enterprise-grade, low-latency multimodal voice-and-vision AI assistant built wit
 - **`web/` (Next.js + TypeScript + Tailwind CSS)**:
   - `/` — Immersive 60fps WebGL/Three.js audio-reactive voice & camera assistant with live PiP self-view, kinetic captions, and expandable RAG citations.
   - `/login` — Credential login and one-time initial administrator bootstrap flow.
-  - `/admin` — Role-gated governance console for Users & Roles, RAG Knowledge Base, AI Agent Configuration (write-only encrypted secrets), MCP Servers, and Security Audit Logs.
+  - `/admin` — Role-gated governance console for Users & Roles, RAG Knowledge Base, AI Agent Configuration (write-only encrypted secrets), MCP Servers, Agent Skills, and Security Audit Logs.
 - **`server/` (Go + Pion WebRTC)**:
   - DTLS-SRTP Opus audio & VP8/H.264 video tracks + ordered `events` SCTP data channel.
-  - Dual-mode `SessionAgent` (`realtime` WebSocket bridge & `cascaded` OpenAI-compatible STT → Vision/RAG/MCP LLM → Streaming TTS).
+  - Dual-mode `SessionAgent` (`realtime` WebSocket bridge & `cascaded` OpenAI-compatible STT → Vision/RAG/Agent Skills/MCP LLM → Streaming TTS); skills are progressively loaded as playbooks and external operations remain restricted to allowlisted MCP tools.
   - AES-256-GCM secret vault, Argon2id password hashing, rotating `HttpOnly; Secure; SameSite=Strict` sessions, CSRF + Origin validation, SSRF-safe outbound dialer, and token-bucket rate limiters.
 - **`db/migrations/` (PostgreSQL + `pgvector`)**:
-  - HNSW cosine similarity index (`vector_cosine_ops`) for RAG document chunks, plus `users`, `sessions`, `signaling_tokens`, `documents`, `agent_configs`, `mcp_servers`, and `audit_logs`.
+  - HNSW cosine similarity index (`vector_cosine_ops`) for RAG document chunks, plus `users`, `sessions`, `signaling_tokens`, `documents`, `agent_configs`, `mcp_servers`, `agent_skills`, and `audit_logs`.
+
+## Agent Skills and MCP Governance
+
+Administrators can upload declarative Agent Skills from **`/admin` → Agent Skills**. A skill is a Markdown `SKILL.md` (uploaded with a `.md` or `.markdown` extension) with `name` and `description` YAML frontmatter, or a `.zip` bundle containing `SKILL.md` and optional UTF-8 text references (`.md`, `.markdown`, `.txt`, `.json`, `.yaml`, or `.yml`). Optional `allowed-tools` frontmatter lists MCP tool names used by the playbook. ZIP bundles may place `SKILL.md` at the archive root or inside one top-level folder.
+
+Uploads are limited to 2 MB compressed, 4 MB expanded, and 32 files. The server validates paths and text content, stores reference files in PostgreSQL, and never executes uploaded content. Re-uploading a skill with the same normalized name updates its content while preserving its identifier and enablement state. Administrators can inspect instructions and reference paths, check MCP tool readiness, enable or disable skills, and delete them. Disabled skills are omitted from agent discovery.
+
+Both `realtime` and `cascaded` agents receive a compact catalog of enabled skill names and descriptions. The model loads relevant instructions with the built-in `load_skill` tool and reads listed references with `read_skill_file`. Skills guide analysis and MCP tool selection but cannot override system security rules or MCP allowlists. MCP tools are exposed only when their server is enabled and each tool is allowlisted; discovered descriptions and input schemas are passed to the model, with colliding tool names routed to their originating server. Tool calls are bounded to six per turn.
+
+The admin API endpoints are:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/admin/skills` | List skill metadata, instructions, and reference paths |
+| `POST` | `/api/v1/admin/skills` | Upload a `.md`, `.markdown`, or `.zip` package as multipart field `file` |
+| `PATCH` | `/api/v1/admin/skills/{id}` | Enable or disable a skill with `{"enabled": true}` |
+| `DELETE` | `/api/v1/admin/skills/{id}` | Delete a skill |
+
+These endpoints require an authenticated administrator and CSRF validation; uploads are rate-limited. Upload, update, and delete actions are written to the security audit log. MCP server enablement, tool descriptions, and per-tool allowlists are managed in **`/admin` → MCP Servers**.
 
 ## Environment Variables
 

@@ -8,6 +8,9 @@ import {
   FileText,
   Bot,
   Plug,
+  BookOpen,
+  ChevronDown,
+  ChevronUp,
   ShieldAlert,
   ArrowLeft,
   LogOut,
@@ -28,8 +31,13 @@ import {
   removeLanguage,
   type VoiceLanguageSettings,
 } from "@/lib/voice-languages";
+import {
+  formatSkillMetadata,
+  getSkillToolReadiness,
+  type AgentSkill,
+} from "@/lib/agent-skills";
 
-type Tab = "users" | "rag" | "agent" | "mcp" | "audit";
+type Tab = "users" | "rag" | "agent" | "mcp" | "skills" | "audit";
 
 interface DocRecord {
   id: string;
@@ -159,6 +167,12 @@ export default function AdminPage() {
   const [mcpAuth, setMcpAuth] = useState("");
   const [mcpTransport, setMcpTransport] = useState<"streamable_http" | "sse">("streamable_http");
 
+  // Agent Skills state
+  const [agentSkills, setAgentSkills] = useState<AgentSkill[]>([]);
+  const [uploadingSkill, setUploadingSkill] = useState(false);
+  const [skillDropActive, setSkillDropActive] = useState(false);
+  const [expandedSkills, setExpandedSkills] = useState<Set<string>>(() => new Set());
+
   // Audit state
   const [logs, setLogs] = useState<AuditLog[]>([]);
 
@@ -179,12 +193,13 @@ export default function AdminPage() {
 
   async function loadAll() {
     try {
-      const [uRes, dRes, cRes, vlRes, mRes, aRes, voicesRes, modelsRes] = await Promise.all([
+      const [uRes, dRes, cRes, vlRes, mRes, skillsRes, aRes, voicesRes, modelsRes] = await Promise.all([
         apiFetch<{ users: AuthUser[] }>("/api/v1/admin/users"),
         apiFetch<{ documents: DocRecord[] }>("/api/v1/admin/documents"),
         apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config"),
         apiFetch<VoiceLanguageSettings>("/api/v1/admin/voice-languages"),
         apiFetch<{ servers: MCPServer[] }>("/api/v1/admin/mcp-servers"),
+        apiFetch<{ skills: AgentSkill[] }>("/api/v1/admin/skills"),
         apiFetch<{ logs: AuditLog[] }>("/api/v1/admin/audit-logs"),
         apiFetch<TTSVoiceDiscovery>("/api/v1/admin/tts-voices"),
         apiFetch<STTModelDiscovery>("/api/v1/admin/stt-models"),
@@ -198,6 +213,7 @@ export default function AdminPage() {
         setSelectedAddLang(avail[0]?.code || "");
       }
       setMcpServers(mRes.servers || []);
+      setAgentSkills(skillsRes.skills || []);
       setLogs(aRes.logs || []);
       setTTSVoiceDiscovery(voicesRes);
       setSTTModelDiscovery(modelsRes);
@@ -262,6 +278,49 @@ export default function AdminPage() {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Upload failed" });
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function uploadAgentSkill(file: File | null) {
+    if (!file) return;
+    setUploadingSkill(true);
+    setNotice(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      await apiFetch("/api/v1/admin/skills", { method: "POST", body: formData });
+      setNotice({ type: "ok", text: `Agent Skill "${file.name}" uploaded or updated.` });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Agent Skill upload failed" });
+    } finally {
+      setUploadingSkill(false);
+    }
+  }
+
+  async function handleToggleAgentSkill(skill: AgentSkill) {
+    setNotice(null);
+    try {
+      await apiFetch(`/api/v1/admin/skills/${skill.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !skill.enabled }),
+      });
+      setNotice({ type: "ok", text: `${skill.name} ${skill.enabled ? "disabled" : "enabled"}.` });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to update Agent Skill" });
+    }
+  }
+
+  async function handleDeleteAgentSkill(skill: AgentSkill) {
+    if (!window.confirm(`Delete the "${skill.name}" Agent Skill?`)) return;
+    setNotice(null);
+    try {
+      await apiFetch(`/api/v1/admin/skills/${skill.id}`, { method: "DELETE" });
+      setNotice({ type: "ok", text: `${skill.name} deleted.` });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to delete Agent Skill" });
     }
   }
 
@@ -429,6 +488,27 @@ export default function AdminPage() {
     }
   }
 
+  async function handleToggleMCPServer(srv: MCPServer) {
+    setNotice(null);
+    try {
+      await apiFetch(`/api/v1/admin/mcp-servers/${srv.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: srv.name,
+          transport: srv.transport,
+          endpointUrl: srv.endpointUrl,
+          enabled: !srv.enabled,
+          allowedTools: srv.allowedTools || [],
+          timeoutMs: srv.timeoutMs,
+        }),
+      });
+      setNotice({ type: "ok", text: `${srv.name} ${srv.enabled ? "disabled" : "enabled"}.` });
+      await loadAll();
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to update MCP server" });
+    }
+  }
+
   async function handleDeleteMCP(id: string) {
     try {
       await apiFetch(`/api/v1/admin/mcp-servers/${id}`, { method: "DELETE" });
@@ -451,6 +531,7 @@ export default function AdminPage() {
     { id: "rag", label: "RAG Knowledge", icon: FileText },
     { id: "agent", label: "AI Agent", icon: Bot },
     { id: "mcp", label: "MCP Servers", icon: Plug },
+    { id: "skills", label: "Agent Skills", icon: BookOpen },
     { id: "audit", label: "Audit Logs", icon: ShieldAlert },
   ];
   const sttModelOptions = includeSavedOption(sttModelDiscovery.models, cfg.sttModel);
@@ -1117,6 +1198,18 @@ export default function AdminPage() {
                     </div>
                     <div className="flex gap-2">
                       <button
+                        type="button"
+                        onClick={() => handleToggleMCPServer(s)}
+                        className={`rounded-lg border px-3 py-1.5 text-xs ${
+                          s.enabled
+                            ? "border-amber-500/30 text-amber-200 hover:bg-amber-500/10"
+                            : "border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10"
+                        }`}
+                      >
+                        {s.enabled ? "Disable Server" : "Enable Server"}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => handleDiscoverMCP(s.id)}
                         className="flex items-center gap-1.5 rounded-lg border border-cyan-500/40 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-500/15"
                       >
@@ -1124,6 +1217,7 @@ export default function AdminPage() {
                         Discover Tools
                       </button>
                       <button
+                        type="button"
                         onClick={() => handleDeleteMCP(s.id)}
                         className="rounded-lg border border-rose-500/30 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/15"
                       >
@@ -1138,14 +1232,20 @@ export default function AdminPage() {
                         return (
                           <label
                             key={tool.name}
-                            className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-700/70 bg-slate-950/60 px-3 py-1.5 text-xs"
+                            className="flex cursor-pointer items-start gap-2 rounded-lg border border-slate-700/70 bg-slate-950/60 px-3 py-2 text-xs"
                           >
                             <input
                               type="checkbox"
                               checked={checked}
                               onChange={() => handleToggleMCPTool(s, tool.name)}
+                              className="mt-0.5"
                             />
-                            <span>{tool.name}</span>
+                            <span>
+                              <span className="block font-medium text-slate-200">{tool.name}</span>
+                              <span className="mt-0.5 block max-w-sm text-slate-400">
+                                {tool.description || "No description provided."}
+                              </span>
+                            </span>
                           </label>
                         );
                       })}
@@ -1154,6 +1254,169 @@ export default function AdminPage() {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {tab === "skills" && (
+          <div className="space-y-6">
+            <label
+              onDragEnter={(e: DragEvent<HTMLLabelElement>) => {
+                e.preventDefault();
+                setSkillDropActive(true);
+              }}
+              onDragOver={(e: DragEvent<HTMLLabelElement>) => e.preventDefault()}
+              onDragLeave={() => setSkillDropActive(false)}
+              onDrop={(e: DragEvent<HTMLLabelElement>) => {
+                e.preventDefault();
+                setSkillDropActive(false);
+                void uploadAgentSkill(e.dataTransfer.files[0] || null);
+              }}
+              className={`flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-slate-900/40 p-8 text-center transition ${
+                skillDropActive
+                  ? "border-cyan-400 bg-cyan-500/10"
+                  : "border-slate-700/70 hover:border-cyan-400/50"
+              }`}
+            >
+              {uploadingSkill ? (
+                <Loader2 className="mb-2 h-7 w-7 animate-spin text-cyan-400" />
+              ) : (
+                <Upload className="mb-2 h-7 w-7 text-cyan-400" />
+              )}
+              <p className="text-sm font-medium text-white">
+                {uploadingSkill ? "Uploading Agent Skill..." : "Drop a SKILL.md or ZIP bundle here"}
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Supports .md, .markdown, and .zip • Maximum upload size 2 MB
+              </p>
+              <input
+                type="file"
+                accept=".md,.markdown,.zip"
+                disabled={uploadingSkill}
+                onChange={(e) => {
+                  void uploadAgentSkill(e.target.files?.[0] || null);
+                  e.currentTarget.value = "";
+                }}
+                className="hidden"
+              />
+            </label>
+
+            {agentSkills.length === 0 ? (
+              <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-8 text-center text-sm text-slate-400">
+                No Agent Skills uploaded yet.
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {agentSkills.map((skill) => {
+                  const metadata = formatSkillMetadata(skill);
+                  const toolReadiness = getSkillToolReadiness(skill.allowedTools || [], mcpServers);
+                  const isExpanded = expandedSkills.has(skill.id);
+                  return (
+                    <article
+                      key={skill.id}
+                      className="rounded-2xl border border-slate-800 bg-slate-900/40 p-5"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="font-medium text-white">{skill.name}</h3>
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-[10px] ${
+                                skill.enabled
+                                  ? "bg-emerald-500/15 text-emerald-300"
+                                  : "bg-slate-700/70 text-slate-300"
+                              }`}
+                            >
+                              {skill.enabled ? "Enabled" : "Disabled"}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-sm text-slate-300">{skill.description}</p>
+                          <p className="mt-2 text-xs text-slate-500">
+                            {metadata.sourceLabel} · {metadata.referenceFileLabel} · {metadata.fileSizeLabel} · {skill.filename}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleAgentSkill(skill)}
+                            className={`rounded-lg border px-3 py-1.5 text-xs ${
+                              skill.enabled
+                                ? "border-amber-500/30 text-amber-200 hover:bg-amber-500/10"
+                                : "border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10"
+                            }`}
+                          >
+                            {skill.enabled ? "Disable" : "Enable"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteAgentSkill(skill)}
+                            className="rounded-lg border border-rose-500/30 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-500/15"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+
+                      {toolReadiness.length > 0 && (
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          {toolReadiness.map((tool) => (
+                            <span
+                              key={tool.toolName}
+                              title={tool.serverNames.length > 0 ? `Available on ${tool.serverNames.join(", ")}` : "No enabled MCP server currently allows this tool"}
+                              className={`rounded-lg border px-2.5 py-1 text-xs ${
+                                tool.status === "ready"
+                                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                                  : "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                              }`}
+                            >
+                              {tool.status === "ready" ? "Ready" : "Unconfigured"} · {tool.toolName}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {toolReadiness.length === 0 && (
+                        <p className="mt-4 text-xs text-slate-500">No MCP tools referenced by this skill.</p>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setExpandedSkills((current) => {
+                            const next = new Set(current);
+                            if (next.has(skill.id)) next.delete(skill.id);
+                            else next.add(skill.id);
+                            return next;
+                          });
+                        }}
+                        aria-expanded={isExpanded}
+                        className="mt-4 flex items-center gap-1.5 text-xs font-medium text-cyan-300 hover:text-cyan-200"
+                      >
+                        {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                        {isExpanded ? "Hide instructions" : "Preview instructions"}
+                      </button>
+                      {isExpanded && (
+                        <div className="mt-3 space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                          <pre className="whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-slate-300">
+                            {skill.instructions}
+                          </pre>
+                          {skill.referenceFilePaths.length > 0 && (
+                            <div className="border-t border-slate-800 pt-3">
+                              <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                                Reference files
+                              </p>
+                              <ul className="space-y-1 text-xs text-slate-400">
+                                {skill.referenceFilePaths.map((referencePath) => (
+                                  <li key={referencePath} className="font-mono">{referencePath}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </article>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
 

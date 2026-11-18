@@ -18,6 +18,7 @@ import (
 	"aegis-voice/server/internal/rag"
 	"aegis-voice/server/internal/rtc"
 	"aegis-voice/server/internal/security"
+	"aegis-voice/server/internal/skills"
 )
 
 type Server struct {
@@ -224,6 +225,164 @@ func (s *Server) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), r, "admin.rag.delete", "document", docID, "success", nil)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+type adminAgentSkillResponse struct {
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	Description        string    `json:"description"`
+	Instructions       string    `json:"instructions"`
+	ReferenceFilePaths []string  `json:"referenceFilePaths"`
+	AllowedTools       []string  `json:"allowedTools"`
+	SourceFormat       string    `json:"sourceFormat"`
+	Filename           string    `json:"filename"`
+	SizeBytes          int64     `json:"sizeBytes"`
+	SHA256Hash         string    `json:"sha256Hash"`
+	Enabled            bool      `json:"enabled"`
+	UploadedBy         *string   `json:"uploadedBy,omitempty"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+}
+
+func toAdminAgentSkillResponse(skill skills.Skill) adminAgentSkillResponse {
+	referencePaths := make([]string, 0, len(skill.ReferenceFiles))
+	for referencePath := range skill.ReferenceFiles {
+		referencePaths = append(referencePaths, referencePath)
+	}
+	sort.Strings(referencePaths)
+	allowedTools := append([]string(nil), skill.AllowedTools...)
+	if allowedTools == nil {
+		allowedTools = []string{}
+	}
+	return adminAgentSkillResponse{
+		ID:                 skill.ID,
+		Name:               skill.Name,
+		Description:        skill.Description,
+		Instructions:       skill.Instructions,
+		ReferenceFilePaths: referencePaths,
+		AllowedTools:       allowedTools,
+		SourceFormat:       skill.SourceFormat,
+		Filename:           skill.Filename,
+		SizeBytes:          skill.SizeBytes,
+		SHA256Hash:         skill.SHA256Hash,
+		Enabled:            skill.Enabled,
+		UploadedBy:         skill.UploadedBy,
+		CreatedAt:          skill.CreatedAt,
+		UpdatedAt:          skill.UpdatedAt,
+	}
+}
+
+func (s *Server) HandleListAgentSkills(w http.ResponseWriter, r *http.Request) {
+	skillList, err := s.adminStore.ListAgentSkills(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list Agent Skills"})
+		return
+	}
+	response := make([]adminAgentSkillResponse, 0, len(skillList))
+	for _, skill := range skillList {
+		response = append(response, toAdminAgentSkillResponse(skill))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"skills": response})
+}
+
+func (s *Server) HandleUploadAgentSkill(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, skills.MaxUploadBytes+(1<<20))
+	if err := r.ParseMultipartForm(skills.MaxUploadBytes); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "upload exceeds maximum size"})
+		} else {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart upload"})
+		}
+		return
+	}
+	if r.MultipartForm != nil {
+		defer func() { _ = r.MultipartForm.RemoveAll() }()
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file field"})
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(file, skills.MaxUploadBytes+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read uploaded skill"})
+		return
+	}
+	parsed, err := skills.ParseUpload(header.Filename, data)
+	if errors.Is(err, skills.ErrUploadTooLarge) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	skill := &skills.Skill{
+		Name:           parsed.Name,
+		Description:    parsed.Description,
+		Instructions:   parsed.Instructions,
+		ReferenceFiles: parsed.ReferenceFiles,
+		AllowedTools:   parsed.AllowedTools,
+		SourceFormat:   parsed.SourceFormat,
+		Filename:       parsed.Filename,
+		SizeBytes:      parsed.SizeBytes,
+		SHA256Hash:     parsed.SHA256Hash,
+		Enabled:        true,
+	}
+	if user, ok := auth.UserFromContext(r.Context()); ok {
+		skill.UploadedBy = &user.ID
+	}
+	saved, err := s.adminStore.UpsertAgentSkillByName(r.Context(), skill)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save Agent Skill"})
+		return
+	}
+	s.audit(r.Context(), r, "admin.skill.upload", "agent_skill", saved.ID, "success", map[string]any{
+		"name":         saved.Name,
+		"sourceFormat": saved.SourceFormat,
+		"filename":     saved.Filename,
+		"sizeBytes":    saved.SizeBytes,
+	})
+	writeJSON(w, http.StatusCreated, map[string]any{"skill": toAdminAgentSkillResponse(*saved)})
+}
+
+func (s *Server) HandleUpdateAgentSkill(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := decodeStrictJSON(r, &req); err != nil || req.Enabled == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "enabled must be provided"})
+		return
+	}
+	skill, err := s.adminStore.UpdateAgentSkillEnabled(r.Context(), r.PathValue("id"), *req.Enabled)
+	if errors.Is(err, ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Agent Skill not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update Agent Skill"})
+		return
+	}
+	s.audit(r.Context(), r, "admin.skill.update", "agent_skill", skill.ID, "success", map[string]any{"enabled": skill.Enabled})
+	writeJSON(w, http.StatusOK, map[string]any{"skill": toAdminAgentSkillResponse(*skill)})
+}
+
+func (s *Server) HandleDeleteAgentSkill(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.adminStore.DeleteAgentSkill(r.Context(), id); errors.Is(err, ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Agent Skill not found"})
+		return
+	} else if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete Agent Skill"})
+		return
+	}
+	s.audit(r.Context(), r, "admin.skill.delete", "agent_skill", id, "success", nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -811,7 +970,11 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 		apiKey, _ = s.vault.Decrypt(cfgRec.APIKeyCiphertext)
 	}
 
-	mcpRecs, _ := s.adminStore.ListMCPServers(ctx)
+	mcpRecs, err := s.adminStore.ListMCPServers(ctx)
+	if err != nil {
+		ps.SendEvent(rtc.NewErrorEvent("Failed to load MCP server configuration."))
+		return
+	}
 	var mcpConfigs []mcp.ServerConfig
 	for _, m := range mcpRecs {
 		var hdr string
@@ -819,14 +982,35 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 			hdr, _ = s.vault.Decrypt(m.AuthHeaderCiphertext)
 		}
 		mcpConfigs = append(mcpConfigs, mcp.ServerConfig{
-			ID:           m.ID,
-			Name:         m.Name,
-			Transport:    m.Transport,
-			EndpointURL:  m.EndpointURL,
-			AuthHeader:   hdr,
-			Enabled:      m.Enabled,
-			AllowedTools: m.AllowedTools,
-			TimeoutMs:    m.TimeoutMs,
+			ID:              m.ID,
+			Name:            m.Name,
+			Transport:       m.Transport,
+			EndpointURL:     m.EndpointURL,
+			AuthHeader:      hdr,
+			Enabled:         m.Enabled,
+			AllowedTools:    m.AllowedTools,
+			DiscoveredTools: m.DiscoveredTools,
+			TimeoutMs:       m.TimeoutMs,
+		})
+	}
+
+	skillRecords, err := s.adminStore.ListAgentSkills(ctx)
+	if err != nil {
+		ps.SendEvent(rtc.NewErrorEvent("Failed to load Agent Skills."))
+		return
+	}
+	var agentSkills []agent.AgentSkill
+	for _, skill := range skillRecords {
+		if !skill.Enabled {
+			continue
+		}
+		agentSkills = append(agentSkills, agent.AgentSkill{
+			Name:           skill.Name,
+			Description:    skill.Description,
+			Instructions:   skill.Instructions,
+			ReferenceFiles: skill.ReferenceFiles,
+			AllowedTools:   skill.AllowedTools,
+			Enabled:        skill.Enabled,
 		})
 	}
 
@@ -858,6 +1042,7 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 		Embedder:   emb,
 		MCPHost:    s.mcpHost,
 		MCPServers: mcpConfigs,
+		Skills:     agentSkills,
 	}
 
 	var sa agent.SessionAgent

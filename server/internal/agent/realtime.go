@@ -18,10 +18,13 @@ import (
 )
 
 type RealtimeAdapter struct {
-	deps   Dependencies
-	mu     sync.Mutex
-	conn   *websocket.Conn
-	cancel context.CancelFunc
+	deps              Dependencies
+	mu                sync.Mutex
+	writeMu           sync.Mutex
+	conn              *websocket.Conn
+	cancel            context.CancelFunc
+	toolCallsThisTurn int
+	toolLimitNotified bool
 }
 
 func NewRealtimeAdapter(deps Dependencies) *RealtimeAdapter {
@@ -96,18 +99,21 @@ func (r *RealtimeAdapter) sendSessionUpdate() error {
 			},
 		},
 	}
-	for _, srv := range r.deps.MCPServers {
-		if !srv.Enabled {
-			continue
-		}
-		for _, tName := range srv.AllowedTools {
-			tools = append(tools, map[string]any{
-				"type":        "function",
-				"name":        tName,
-				"description": "MCP tool from " + srv.Name,
-				"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
-			})
-		}
+	for _, tool := range BuildMCPToolRegistry(r.deps.MCPServers) {
+		tools = append(tools, map[string]any{
+			"type":        "function",
+			"name":        tool.Name,
+			"description": tool.Description,
+			"parameters":  tool.InputSchema,
+		})
+	}
+	for _, definition := range SkillToolDefinitions(r.deps.Skills) {
+		tools = append(tools, map[string]any{
+			"type":        "function",
+			"name":        definition.Name,
+			"description": definition.Description,
+			"parameters":  definition.Parameters,
+		})
 	}
 
 	vl := r.deps.Config.VoiceLanguages
@@ -129,7 +135,7 @@ func (r *RealtimeAdapter) sendSessionUpdate() error {
 	return r.writeJSON(map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
-			"instructions": BuildSystemPrompt(r.deps.Config.SystemInstructions) + langPolicy,
+			"instructions": BuildSystemPromptWithSkills(r.deps.Config.SystemInstructions, r.deps.Skills) + langPolicy,
 			"tools":        tools,
 		},
 	})
@@ -165,6 +171,8 @@ func (r *RealtimeAdapter) Close() error {
 }
 
 func (r *RealtimeAdapter) writeJSON(v any) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
 	conn := r.conn
 	r.mu.Unlock()
@@ -207,6 +215,7 @@ func (r *RealtimeAdapter) readLoop(ctx context.Context) {
 
 		switch ev.Type {
 		case "input_audio_buffer.speech_started":
+			r.resetToolCallBudget()
 			r.BargeIn()
 			r.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
 		case "response.audio.delta":
@@ -222,6 +231,10 @@ func (r *RealtimeAdapter) readLoop(ctx context.Context) {
 				r.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.delta", "assistant", clean))
 			}
 		case "response.function_call_arguments.done":
+			if !r.reserveToolCall() {
+				go r.handleToolCallLimit(ctx, ev.CallID)
+				continue
+			}
 			go r.handleToolCall(ctx, ev.CallID, ev.Name, ev.Arguments)
 		case "response.done":
 			r.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
@@ -241,7 +254,9 @@ func (r *RealtimeAdapter) handleToolCall(ctx context.Context, callID, name, rawA
 	_ = json.Unmarshal([]byte(rawArgs), &args)
 
 	var output string
-	if name == "search_knowledge_base" && r.deps.RAGService != nil && r.deps.Embedder != nil {
+	if skillOutput, handled := HandleSkillTool(r.deps.Skills, name, args); handled {
+		output = skillOutput
+	} else if name == "search_knowledge_base" && r.deps.RAGService != nil && r.deps.Embedder != nil {
 		q, _ := args["query"].(string)
 		hits, err := r.deps.RAGService.Retrieve(ctx, q, r.deps.Config.RAGTopK, r.deps.Config.RAGMinSimilarity, r.deps.Embedder)
 		if err == nil && len(hits) > 0 {
@@ -252,16 +267,12 @@ func (r *RealtimeAdapter) handleToolCall(ctx context.Context, callID, name, rawA
 		}
 	} else {
 		var target *mcp.ServerConfig
-		for i := range r.deps.MCPServers {
-			srv := &r.deps.MCPServers[i]
-			if !srv.Enabled {
-				continue
-			}
-			for _, allowed := range srv.AllowedTools {
-				if allowed == name {
-					target = srv
-					break
-				}
+		for _, binding := range BuildMCPToolRegistry(r.deps.MCPServers) {
+			if binding.Name == name {
+				server := binding.Server
+				target = &server
+				name = binding.RawName
+				break
 			}
 		}
 		if target != nil && r.deps.MCPHost != nil {
@@ -285,4 +296,46 @@ func (r *RealtimeAdapter) handleToolCall(ctx context.Context, callID, name, rawA
 		},
 	})
 	_ = r.writeJSON(map[string]any{"type": "response.create"})
+}
+
+func (r *RealtimeAdapter) resetToolCallBudget() {
+	r.mu.Lock()
+	r.toolCallsThisTurn = 0
+	r.toolLimitNotified = false
+	r.mu.Unlock()
+}
+
+func (r *RealtimeAdapter) reserveToolCall() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.toolCallsThisTurn >= maxToolRounds {
+		return false
+	}
+	r.toolCallsThisTurn++
+	return true
+}
+
+func (r *RealtimeAdapter) handleToolCallLimit(ctx context.Context, callID string) {
+	r.deps.Sink.SendEvent(rtc.Event{
+		Type:      "tool.call",
+		Tool:      "tool_call_limit",
+		Status:    "blocked",
+		Timestamp: time.Now().UnixMilli(),
+	})
+	_ = r.writeJSON(map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type":    "function_call_output",
+			"call_id": callID,
+			"output":  "Tool-call budget exhausted. Synthesize the best response from the information already available and do not call additional tools.",
+		},
+	})
+
+	r.mu.Lock()
+	shouldContinue := !r.toolLimitNotified
+	r.toolLimitNotified = true
+	r.mu.Unlock()
+	if shouldContinue && ctx.Err() == nil {
+		_ = r.writeJSON(map[string]any{"type": "response.create"})
+	}
 }
