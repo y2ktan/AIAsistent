@@ -166,6 +166,9 @@ export default function AdminPage() {
   const [mcpUrl, setMcpUrl] = useState("");
   const [mcpAuth, setMcpAuth] = useState("");
   const [mcpTransport, setMcpTransport] = useState<"streamable_http" | "sse">("streamable_http");
+  const [hiddenMCPToolServers, setHiddenMCPToolServers] = useState<Set<string>>(
+    () => new Set()
+  );
 
   // Agent Skills state
   const [agentSkills, setAgentSkills] = useState<AgentSkill[]>([]);
@@ -486,6 +489,18 @@ export default function AdminPage() {
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to update tool allowlist" });
     }
+  }
+
+  function handleToggleMCPToolsVisibility(serverId: string) {
+    setHiddenMCPToolServers((current) => {
+      const next = new Set(current);
+      if (next.has(serverId)) {
+        next.delete(serverId);
+      } else {
+        next.add(serverId);
+      }
+      return next;
+    });
   }
 
   async function handleToggleMCPServer(srv: MCPServer) {
@@ -1184,11 +1199,14 @@ export default function AdminPage() {
             </form>
 
             <div className="space-y-4">
-              {mcpServers.map((s) => (
-                <div
-                  key={s.id}
-                  className="rounded-2xl border border-slate-800 bg-slate-900/40 p-5"
-                >
+              {mcpServers.map((s) => {
+                const toolsHidden = hiddenMCPToolServers.has(s.id);
+                const toolsPanelId = `mcp-tools-${s.id}`;
+                return (
+                  <div
+                    key={s.id}
+                    className="rounded-2xl border border-slate-800 bg-slate-900/40 p-5"
+                  >
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h3 className="font-medium text-white">{s.name}</h3>
@@ -1216,6 +1234,17 @@ export default function AdminPage() {
                         <RefreshCw className="h-3.5 w-3.5" />
                         Discover Tools
                       </button>
+                      {s.discoveredTools && s.discoveredTools.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => handleToggleMCPToolsVisibility(s.id)}
+                          aria-expanded={!toolsHidden}
+                          aria-controls={toolsPanelId}
+                          className="rounded-lg border border-slate-600/60 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-700/30"
+                        >
+                          {toolsHidden ? "Show Tools" : "Hide Tools"}
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => handleDeleteMCP(s.id)}
@@ -1225,8 +1254,8 @@ export default function AdminPage() {
                       </button>
                     </div>
                   </div>
-                  {s.discoveredTools && s.discoveredTools.length > 0 && (
-                    <div className="mt-4 flex flex-wrap gap-2">
+                  {s.discoveredTools && s.discoveredTools.length > 0 && !toolsHidden && (
+                    <div id={toolsPanelId} className="mt-4 flex flex-wrap gap-2">
                       {s.discoveredTools.map((tool) => {
                         const checked = s.allowedTools?.includes(tool.name);
                         return (
@@ -1251,8 +1280,9 @@ export default function AdminPage() {
                       })}
                     </div>
                   )}
-                </div>
-              ))}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

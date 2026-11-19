@@ -40,7 +40,7 @@ The system SHALL allow administrators to configure active AI pipeline mode (`rea
 - **THEN** the backend verifies connectivity server-side and returns a sanitized pass/fail status without exposing stored credentials to the browser
 
 ### Requirement: MCP server registration and policy configuration
-The system SHALL allow administrators to register, enable, disable, and test Model Context Protocol (MCP) server connections with explicit transport settings, visible tool descriptions, and tool allowlists.
+The system SHALL allow administrators to register, enable, disable, and test Model Context Protocol (MCP) server connections with explicit transport settings, visible tool descriptions, tool allowlists, and independent visibility controls for each server's discovered tool list.
 
 #### Scenario: Administrator registers and tests an MCP server
 - **WHEN** an administrator configures an MCP server URL/transport and runs tool discovery
@@ -49,6 +49,14 @@ The system SHALL allow administrators to register, enable, disable, and test Mod
 #### Scenario: Administrator disables an MCP server without deleting it
 - **WHEN** an administrator toggles an existing MCP server to disabled on `/admin`
 - **THEN** the server configuration and allowlist remain saved, and none of its tools are exposed to or callable by the conversational agent until re-enabled
+
+#### Scenario: Administrator hides one server's discovered tools
+- **WHEN** an administrator hides the discovered-tools list for an MCP server
+- **THEN** only that server's discovered-tools list is collapsed, while the server card, server state, discovered tools, and saved allowlist remain unchanged
+
+#### Scenario: Tool checkbox update preserves discovered-tools visibility
+- **WHEN** an administrator enables or disables a discovered tool with its checkbox
+- **THEN** the system saves the updated allowlist and preserves that server's current discovered-tools visibility
 
 ### Requirement: Agent skill governance workspace
 The system SHALL provide a dedicated Agent Skills tab on `/admin` allowing administrators to upload `.md` or `.zip` skill packages, replace an existing skill by name, inspect parsed metadata and instructions, view referenced MCP tool readiness, toggle skill enablement, and delete skills.
