@@ -21,13 +21,13 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
-import { useVoiceAgentRTC } from "@/hooks/useVoiceAgentRTC";
+import { filterVisibleCitations, useVoiceAgentRTC } from "@/hooks/useVoiceAgentRTC";
 import { LiquidPlasmaOrb } from "@/components/LiquidPlasmaOrb";
 
 export default function HomePage() {
   const router = useRouter();
   const [user, setUser] = useState<AuthUser | null>(null);
-  const [expandedCitation, setExpandedCitation] = useState<number | null>(null);
+  const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
 
   const {
     connected,
@@ -71,6 +71,7 @@ export default function HomePage() {
   }
 
   const latestTranscripts = transcripts.slice(-3);
+  const visibleCitations = filterVisibleCitations(citations);
 
   return (
     <main className="relative flex min-h-screen flex-col justify-between overflow-hidden bg-[#05070F] text-slate-100">
@@ -151,17 +152,18 @@ export default function HomePage() {
         )}
 
         {/* Grounded RAG Citation Cards */}
-        {citations.length > 0 && (
+        {user?.role === "admin" && visibleCitations.length > 0 && (
           <div className="mt-4 flex w-full max-w-2xl flex-wrap justify-center gap-2">
-            {citations.map((c, idx) => {
-              const isOpen = expandedCitation === idx;
+            {visibleCitations.map((c) => {
+              const citationKey = `${c.documentId}-${c.chunkIndex}`;
+              const isOpen = expandedCitation === citationKey;
               return (
                 <div
-                  key={`${c.documentId}-${c.chunkIndex}`}
+                  key={citationKey}
                   className="rounded-xl border border-emerald-500/30 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-100 backdrop-blur-xl"
                 >
                   <button
-                    onClick={() => setExpandedCitation(isOpen ? null : idx)}
+                    onClick={() => setExpandedCitation(isOpen ? null : citationKey)}
                     className="flex items-center gap-1.5 font-medium"
                   >
                     <BookOpen className="h-3.5 w-3.5 text-emerald-400" />

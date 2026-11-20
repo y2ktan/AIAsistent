@@ -32,6 +32,35 @@ export interface RTCEventPayload {
   ts?: number;
 }
 
+export function isAgentSkillCitation(citation: CitationItem): boolean {
+  const normalizedTitle = citation.documentTitle.trim().replace(/\\/g, "/").toLowerCase();
+  const basename = normalizedTitle.split("/").pop() || "";
+  if (basename === "skill.md" || basename === "skill.markdown") {
+    return true;
+  }
+
+  const markdownTitle = basename.endsWith(".md") || basename.endsWith(".markdown");
+  const untitledDocument = basename !== "" && !basename.includes(".");
+  if (!markdownTitle && !untitledDocument) {
+    return false;
+  }
+
+  const content = citation.content.trimStart();
+  if (!content.startsWith("---")) {
+    return false;
+  }
+  const frontmatterEnd = content.indexOf("\n---", 3);
+  if (frontmatterEnd < 0) {
+    return false;
+  }
+  const frontmatter = content.slice(3, frontmatterEnd);
+  return /^\s*name\s*:/im.test(frontmatter) && /^\s*description\s*:/im.test(frontmatter);
+}
+
+export function filterVisibleCitations(citations: CitationItem[]): CitationItem[] {
+  return citations.filter((citation) => !isAgentSkillCitation(citation));
+}
+
 export function parseRTCEvent(raw: string): RTCEventPayload | null {
   try {
     const parsed = JSON.parse(raw) as RTCEventPayload;
@@ -146,7 +175,7 @@ export function useVoiceAgentRTC() {
         break;
       case "citation":
         if (Array.isArray(ev.citations)) {
-          setCitations(ev.citations);
+          setCitations(filterVisibleCitations(ev.citations));
         }
         break;
       case "tool.call":
