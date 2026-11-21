@@ -37,6 +37,7 @@ type AgentConfigRecord struct {
 	APIKeyLast4        string    `json:"apiKeyPreview"`
 	RAGTopK            int       `json:"ragTopK"`
 	RAGMinSimilarity   float64   `json:"ragMinSimilarity"`
+	AudioFocusEnabled  bool      `json:"audioFocusEnabled"`
 	UpdatedAt          time.Time `json:"updatedAt"`
 }
 

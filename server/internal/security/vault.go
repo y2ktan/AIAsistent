@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	ErrInvalidMasterKey = errors.New("master encryption key must be 32 bytes (64 hex chars or 32-byte base64)")
+	ErrInvalidMasterKey  = errors.New("master encryption key must be 32 bytes (64 hex chars or 32-byte base64)")
 	ErrInvalidCiphertext = errors.New("invalid or tampered ciphertext")
 )
 

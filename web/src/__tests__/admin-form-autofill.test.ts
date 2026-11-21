@@ -116,6 +116,28 @@ describe("admin form autofill settings", () => {
     expect(bearerToken?.getAttribute("autocomplete")).toBe("new-password");
   });
 
+  it("renders Audio Focus enabled by default in AI Agent settings", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(createElement(AdminPage));
+    });
+
+    const agentTab = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("AI Agent")
+    );
+    await act(async () => {
+      agentTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.textContent).toContain("Audio Focus");
+    const audioFocusCheckbox = Array.from(container.querySelectorAll<HTMLInputElement>("input[type='checkbox']"))
+      .find((input) => input.closest("label")?.textContent?.includes("Audio Focus"));
+    expect(audioFocusCheckbox?.checked).toBe(true);
+  });
+
   it("hides discovered tools per server without changing server cards or allowlists", async () => {
     mcpMocks.servers = [
       {

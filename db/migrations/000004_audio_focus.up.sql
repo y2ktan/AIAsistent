@@ -1,0 +1,2 @@
+ALTER TABLE agent_configs
+ADD COLUMN IF NOT EXISTS audio_focus_enabled BOOLEAN NOT NULL DEFAULT TRUE;

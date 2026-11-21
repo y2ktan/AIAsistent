@@ -212,6 +212,9 @@ func TestRealtimeAdapterWebSocketBridge(t *testing.T) {
 		if !strings.Contains(string(msg), "Mandarin Chinese") || !strings.Contains(string(msg), "Default language: Mandarin Chinese") || !strings.Contains(string(msg), "cannot be determined") {
 			t.Errorf("expected language policy with undetermined fallback in session.update instructions, got %s", string(msg))
 		}
+		if !strings.Contains(string(msg), `"input_audio_noise_reduction":{"type":"near_field"}`) {
+			t.Errorf("expected near_field audio noise reduction in session.update, got %s", string(msg))
+		}
 
 		// Send audio + transcript delta
 		_ = conn.WriteJSON(map[string]any{
@@ -229,10 +232,11 @@ func TestRealtimeAdapterWebSocketBridge(t *testing.T) {
 	sink := &mockSink{}
 	adapter := NewRealtimeAdapter(Dependencies{
 		Config: AgentConfig{
-			Mode:          "realtime",
-			RealtimeWSURL: wsSrv.URL,
-			APIKey:        "sk-realtime-test",
-			AllowPrivate:  true,
+			Mode:              "realtime",
+			RealtimeWSURL:     wsSrv.URL,
+			APIKey:            "sk-realtime-test",
+			AllowPrivate:      true,
+			AudioFocusEnabled: true,
 			VoiceLanguages: VoiceLanguageSettings{
 				DefaultCode: "zh",
 				Languages: []VoiceLanguage{
@@ -257,6 +261,46 @@ func TestRealtimeAdapterWebSocketBridge(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for realtime transcript and audio delta")
+}
+
+func TestRealtimeAdapterOmitsNoiseReductionWhenAudioFocusDisabled(t *testing.T) {
+	received := make(chan []byte, 1)
+	upgrader := websocket.Upgrader{}
+	wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, msg, err := conn.ReadMessage()
+		if err == nil {
+			received <- msg
+		}
+	}))
+	defer wsSrv.Close()
+
+	adapter := NewRealtimeAdapter(Dependencies{
+		Config: AgentConfig{
+			Mode:              "realtime",
+			RealtimeWSURL:     wsSrv.URL,
+			AllowPrivate:      true,
+			AudioFocusEnabled: false,
+		},
+		Sink: &mockSink{},
+	})
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("Realtime Start failed: %v", err)
+	}
+	defer func() { _ = adapter.Close() }()
+
+	select {
+	case msg := <-received:
+		if strings.Contains(string(msg), "input_audio_noise_reduction") {
+			t.Fatalf("expected noise reduction to be omitted when Audio Focus is disabled, got %s", string(msg))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for realtime session.update")
+	}
 }
 
 func TestTranscribeVerboseJSONAndFallback(t *testing.T) {

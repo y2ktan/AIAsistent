@@ -47,6 +47,9 @@ func (s *Server) Router() http.Handler {
 	)
 
 	// WebRTC Signaling routes
+	mux.Handle("GET /api/v1/rtc/config",
+		s.authSvc.RequireAuth(http.HandlerFunc(s.HandleRTCConfig)),
+	)
 	mux.Handle("POST /api/v1/rtc/token",
 		auth.RateLimitMiddleware(sigLimiter, auth.ClientIP)(
 			s.authSvc.RequireAuth(s.authSvc.RequireCSRF(http.HandlerFunc(s.authSvc.HandleIssueSignalingToken))),

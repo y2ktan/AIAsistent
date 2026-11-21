@@ -13,13 +13,13 @@ import (
 )
 
 const (
-	argonMemory  uint32 = 64 * 1024 // 64 MB
-	argonTime    uint32 = 3
-	argonThreads uint8  = 2
-	argonKeyLen  uint32 = 32
-	saltLen             = 16
-	MinPasswordLen      = 12
-	MaxPasswordLen      = 128
+	argonMemory    uint32 = 64 * 1024 // 64 MB
+	argonTime      uint32 = 3
+	argonThreads   uint8  = 2
+	argonKeyLen    uint32 = 32
+	saltLen               = 16
+	MinPasswordLen        = 12
+	MaxPasswordLen        = 128
 )
 
 var (

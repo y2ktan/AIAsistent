@@ -132,12 +132,17 @@ func (r *RealtimeAdapter) sendSessionUpdate() error {
 	}
 	langPolicy := "\n\nLANGUAGE POLICY:\n- Supported spoken reply languages: " + strings.Join(voicedNames, ", ") + ".\n- Default language: " + defName + ".\n- Always reply in the language of the user's most recent utterance if it is in the supported spoken list. If the language of an utterance cannot be determined, reply in the language of your previous reply in this session, or in " + defName + " if there is no previous reply. Otherwise, interpret their message as well as you can, reply in " + defName + ", and tell them once per session (without repeating) that you cannot reply in that language yet."
 
+	session := map[string]any{
+		"instructions": BuildSystemPromptWithSkills(r.deps.Config.SystemInstructions, r.deps.Skills) + langPolicy,
+		"tools":        tools,
+	}
+	if r.deps.Config.AudioFocusEnabled {
+		session["input_audio_noise_reduction"] = map[string]any{"type": "near_field"}
+	}
+
 	return r.writeJSON(map[string]any{
-		"type": "session.update",
-		"session": map[string]any{
-			"instructions": BuildSystemPromptWithSkills(r.deps.Config.SystemInstructions, r.deps.Skills) + langPolicy,
-			"tools":        tools,
-		},
+		"type":    "session.update",
+		"session": session,
 	})
 }
 

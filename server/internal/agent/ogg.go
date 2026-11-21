@@ -77,7 +77,7 @@ func EncodeOggOpus(frames [][]byte) []byte {
 		0x38, 0x01, // pre-skip (312 samples LE)
 		0x80, 0xbb, 0x00, 0x00, // input sample rate 48000 Hz LE
 		0x00, 0x00, // output gain
-		0,          // channel mapping family
+		0, // channel mapping family
 	}
 	writeOggPage(&buf, 0x02, 0, serial, 0, opusHead)
 
@@ -219,4 +219,3 @@ func OpusPacketDuration(pkt []byte) time.Duration {
 	}
 	return frameDur * time.Duration(frames)
 }
-

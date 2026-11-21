@@ -67,6 +67,7 @@ import {
   isAgentSkillCitation,
   parseRTCEvent,
 } from "@/hooks/useVoiceAgentRTC";
+import { buildMicrophoneConstraints } from "@/lib/audio-focus";
 
 describe("parseRTCEvent", () => {
   it("parses valid state and citation events", () => {
@@ -136,6 +137,17 @@ describe("Agent Skill citation filtering", () => {
       "Onboarding.md",
       "Skill.pdf",
     ]);
+  });
+
+  describe("RTC Audio Focus capture", () => {
+    it("enables voice isolation for the default-on Audio Focus capture path", () => {
+      expect(buildMicrophoneConstraints(true)).toMatchObject({
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        voiceIsolation: true,
+      });
+    });
   });
 
   it("returns an empty list when an event contains only Agent Skill citations", () => {

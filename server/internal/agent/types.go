@@ -26,6 +26,7 @@ type AgentConfig struct {
 	APIKey             string
 	RAGTopK            int
 	RAGMinSimilarity   float64
+	AudioFocusEnabled  bool
 	AllowPrivate       bool
 	VoiceLanguages     VoiceLanguageSettings
 }

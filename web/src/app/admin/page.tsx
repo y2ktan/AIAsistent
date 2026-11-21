@@ -68,6 +68,7 @@ interface AgentConfig {
   apiKeyPreview: string;
   ragTopK: number;
   ragMinSimilarity: number;
+  audioFocusEnabled: boolean;
 }
 
 interface TTSVoiceDiscovery {
@@ -138,6 +139,7 @@ export default function AdminPage() {
     apiKeyPreview: "",
     ragTopK: 5,
     ragMinSimilarity: 0.35,
+    audioFocusEnabled: true,
   });
   const [newApiKey, setNewApiKey] = useState("");
   const [testingConn, setTestingConn] = useState(false);
@@ -360,6 +362,7 @@ export default function AdminPage() {
         apiKey: newApiKey,
         ragTopK: Number(cfg.ragTopK) || 5,
         ragMinSimilarity: Number(cfg.ragMinSimilarity) || 0.35,
+        audioFocusEnabled: cfg.audioFocusEnabled !== false,
       };
       const res = await apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config", {
         method: "PUT",
@@ -947,6 +950,22 @@ export default function AdminPage() {
                 className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
               />
             </div>
+
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-700/60 bg-slate-950/50 p-4">
+              <input
+                type="checkbox"
+                checked={cfg.audioFocusEnabled !== false}
+                onChange={(e) => setCfg({ ...cfg, audioFocusEnabled: e.target.checked })}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-sm font-medium text-white">Audio Focus</span>
+                <span className="mt-1 block text-xs leading-relaxed text-slate-400">
+                  Isolate the near-field speaker and filter ambient environmental noise before
+                  WebRTC audio transmission. Enabled by default and used by new voice sessions.
+                </span>
+              </span>
+            </label>
 
             <div className="flex flex-wrap gap-3">
               <button

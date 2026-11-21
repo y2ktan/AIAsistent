@@ -102,7 +102,7 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		       tts_base_url, tts_model, tts_voice,
 		       embedding_base_url, embedding_model, embedding_dim,
 		       system_instructions, api_key_ciphertext, api_key_last4,
-		       rag_top_k, rag_min_similarity, updated_at
+		       rag_top_k, rag_min_similarity, audio_focus_enabled, updated_at
 		FROM agent_configs WHERE name = 'default'
 	`).Scan(
 		&r.ID, &r.Name, &r.Mode, &r.RealtimeWSURL, &r.RealtimeModel,
@@ -110,20 +110,21 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		&r.TTSBaseURL, &r.TTSModel, &r.TTSVoice,
 		&r.EmbeddingBaseURL, &r.EmbeddingModel, &r.EmbeddingDim,
 		&r.SystemInstructions, &r.APIKeyCiphertext, &r.APIKeyLast4,
-		&r.RAGTopK, &r.RAGMinSimilarity, &r.UpdatedAt,
+		&r.RAGTopK, &r.RAGMinSimilarity, &r.AudioFocusEnabled, &r.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &AgentConfigRecord{
-			Name:             "default",
-			Mode:             "cascaded",
-			STTModel:         "whisper-1",
-			LLMModel:         "gpt-4o",
-			TTSModel:         "tts-1",
-			TTSVoice:         "alloy",
-			EmbeddingModel:   "text-embedding-3-small",
-			EmbeddingDim:     1536,
-			RAGTopK:          5,
-			RAGMinSimilarity: 0.35,
+			Name:              "default",
+			Mode:              "cascaded",
+			STTModel:          "whisper-1",
+			LLMModel:          "gpt-4o",
+			TTSModel:          "tts-1",
+			TTSVoice:          "alloy",
+			EmbeddingModel:    "text-embedding-3-small",
+			EmbeddingDim:      1536,
+			RAGTopK:           5,
+			RAGMinSimilarity:  0.35,
+			AudioFocusEnabled: true,
 		}, nil
 	}
 	return r, err
@@ -137,9 +138,9 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			tts_base_url, tts_model, tts_voice,
 			embedding_base_url, embedding_model, embedding_dim,
 			system_instructions, api_key_ciphertext, api_key_last4,
-			rag_top_k, rag_min_similarity, updated_at
+			rag_top_k, rag_min_similarity, audio_focus_enabled, updated_at
 		) VALUES (
-			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW()
+			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW()
 		)
 		ON CONFLICT (name) DO UPDATE SET
 			mode = EXCLUDED.mode,
@@ -160,6 +161,7 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			api_key_last4 = CASE WHEN EXCLUDED.api_key_last4 <> '' THEN EXCLUDED.api_key_last4 ELSE agent_configs.api_key_last4 END,
 			rag_top_k = EXCLUDED.rag_top_k,
 			rag_min_similarity = EXCLUDED.rag_min_similarity,
+			audio_focus_enabled = EXCLUDED.audio_focus_enabled,
 			updated_at = NOW()
 		RETURNING id::text, updated_at
 	`,
@@ -168,7 +170,7 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 		rec.TTSBaseURL, rec.TTSModel, rec.TTSVoice,
 		rec.EmbeddingBaseURL, rec.EmbeddingModel, rec.EmbeddingDim,
 		rec.SystemInstructions, rec.APIKeyCiphertext, rec.APIKeyLast4,
-		rec.RAGTopK, rec.RAGMinSimilarity,
+		rec.RAGTopK, rec.RAGMinSimilarity, rec.AudioFocusEnabled,
 	).Scan(&rec.ID, &rec.UpdatedAt)
 }
 

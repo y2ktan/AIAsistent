@@ -21,21 +21,21 @@ var blockedCIDRs []*net.IPNet
 
 func init() {
 	cidrs := []string{
-		"0.0.0.0/8",          // Current network
-		"10.0.0.0/8",         // RFC1918
-		"100.64.0.0/10",      // CGNAT
-		"127.0.0.0/8",        // Loopback
-		"169.254.0.0/16",     // Link-local / Cloud Metadata
-		"172.16.0.0/12",      // RFC1918
-		"192.0.0.0/24",       // IETF Protocol Assignments
-		"192.168.0.0/16",     // RFC1918
-		"224.0.0.0/4",        // Multicast
-		"240.0.0.0/4",        // Reserved
-		"::/128",             // Unspecified IPv6
-		"::1/128",            // Loopback IPv6
-		"fc00::/7",           // Unique local IPv6
-		"fe80::/10",          // Link-local IPv6
-		"ff00::/8",           // Multicast IPv6
+		"0.0.0.0/8",      // Current network
+		"10.0.0.0/8",     // RFC1918
+		"100.64.0.0/10",  // CGNAT
+		"127.0.0.0/8",    // Loopback
+		"169.254.0.0/16", // Link-local / Cloud Metadata
+		"172.16.0.0/12",  // RFC1918
+		"192.0.0.0/24",   // IETF Protocol Assignments
+		"192.168.0.0/16", // RFC1918
+		"224.0.0.0/4",    // Multicast
+		"240.0.0.0/4",    // Reserved
+		"::/128",         // Unspecified IPv6
+		"::1/128",        // Loopback IPv6
+		"fc00::/7",       // Unique local IPv6
+		"fe80::/10",      // Link-local IPv6
+		"ff00::/8",       // Multicast IPv6
 	}
 	for _, c := range cidrs {
 		_, ipNet, err := net.ParseCIDR(c)

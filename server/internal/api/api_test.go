@@ -42,7 +42,7 @@ func newMockAllStore() *mockAllStore {
 		signalingTokens: make(map[string]*auth.SignalingToken),
 		mcpServers:      make(map[string]*MCPServerRecord),
 		agentSkills:     make(map[string]*skills.Skill),
-		agentCfg:        &AgentConfigRecord{Name: "default", Mode: "cascaded"},
+		agentCfg:        &AgentConfigRecord{Name: "default", Mode: "cascaded", AudioFocusEnabled: true},
 	}
 }
 
@@ -580,6 +580,35 @@ func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {
 	if strings.Contains(body, "sk-super-secret") || !strings.Contains(body, "****9999") {
 		t.Fatalf("expected masked key preview ****9999 and no plaintext, got: %s", body)
 	}
+	if !strings.Contains(body, `"audioFocusEnabled":true`) {
+		t.Fatalf("expected omitted audioFocusEnabled update to preserve default true, got: %s", body)
+	}
+
+	// Audio Focus can be disabled explicitly and is available to authenticated voice sessions.
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/agent-config", bytes.NewBufferString(`{"mode":"cascaded","audioFocusEnabled":false}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"audioFocusEnabled":false`) {
+		t.Fatalf("expected audio focus to be disabled, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/rtc/config", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated rtc config request to be rejected, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/rtc/config", nil)
+	req.AddCookie(adminCookie)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "{\"audioFocusEnabled\":false}\n" {
+		t.Fatalf("expected authenticated rtc config with audioFocusEnabled=false, got %d: %s", rec.Code, rec.Body.String())
+	}
 
 	// 4. Last-admin lockout protection returns 409 Conflict
 	req = httptest.NewRequest(http.MethodPatch, "/api/v1/admin/users/admin-1", bytes.NewBufferString(`{"role":"user","isActive":false}`))
@@ -597,7 +626,7 @@ func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {
 	req.AddCookie(adminCookie)
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "admin.agent_config.update") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "admin.agent_config.update") || !strings.Contains(rec.Body.String(), `"audioFocusEnabled":false`) {
 		t.Fatalf("expected audit log entry, got %d %s", rec.Code, rec.Body.String())
 	}
 }

@@ -8,6 +8,8 @@ Enterprise-grade, low-latency multimodal voice-and-vision AI assistant built wit
   - `/` — Immersive 60fps WebGL/Three.js audio-reactive voice & camera assistant with live PiP self-view, kinetic captions, and expandable RAG citations.
   - `/login` — Credential login and one-time initial administrator bootstrap flow.
   - `/admin` — Role-gated governance console for Users & Roles, RAG Knowledge Base, AI Agent Configuration (write-only encrypted secrets), MCP Servers, Agent Skills, and Security Audit Logs.
+- **Audio Focus** is enabled by default and can be toggled in **`/admin` → AI Agent**. It isolates near-field speech with browser voice-isolation capture hints, speech-band Web Audio filtering, adaptive ambient-noise VAD, and downstream gating before audio is sent over WebRTC. `realtime` sessions also request provider-side `near_field` input noise reduction.
+  - Authenticated callers receive only the non-secret `audioFocusEnabled` flag from `GET /api/v1/rtc/config`; provider credentials and full admin configuration remain admin-only.
 - **`server/` (Go + Pion WebRTC)**:
   - DTLS-SRTP Opus audio & VP8/H.264 video tracks + ordered `events` SCTP data channel.
   - Dual-mode `SessionAgent` (`realtime` WebSocket bridge & `cascaded` OpenAI-compatible STT → Vision/RAG/Agent Skills/MCP LLM → Streaming TTS); skills are progressively loaded as playbooks and external operations remain restricted to allowlisted MCP tools.

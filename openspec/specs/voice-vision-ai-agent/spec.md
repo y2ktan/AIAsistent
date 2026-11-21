@@ -17,6 +17,17 @@ The system SHALL support both native real-time multimodal streaming endpoints an
 - **WHEN** the active agent mode is set to `cascaded` against an OpenAI-compatible endpoint and the user finishes an utterance
 - **THEN** the system transcribes the speech, evaluates the query with any active camera frame, RAG context, enabled Agent Skills, and MCP tools across multi-step tool rounds, and streams synthesized speech back to the user
 
+### Requirement: Realtime near-field input noise reduction alignment
+When the active agent pipeline mode is `realtime`, the system SHALL configure upstream near-field input audio noise reduction whenever Audio Focus is enabled and SHALL omit near-field noise reduction when Audio Focus is disabled.
+
+#### Scenario: Realtime session starts with Audio Focus enabled
+- **WHEN** a `realtime` session initializes while Audio Focus is enabled
+- **THEN** the `session.update` payload sent to the Realtime provider includes `input_audio_noise_reduction` configured for `near_field` speaker isolation
+
+#### Scenario: Realtime session starts with Audio Focus disabled
+- **WHEN** a `realtime` session initializes while Audio Focus is disabled
+- **THEN** the `session.update` payload omits `near_field` input noise reduction
+
 ### Requirement: Grounded answers prioritized from retrieved knowledge
 The system SHALL consult ingested knowledge base context when answering factual domain questions and SHALL surface source citations alongside spoken responses.
 

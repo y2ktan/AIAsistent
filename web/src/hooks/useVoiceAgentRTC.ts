@@ -2,6 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api-client";
+import {
+  AdaptiveVAD,
+  buildMicrophoneConstraints,
+  createAudioFocusGraph,
+  setAudioFocusSpeechGate,
+  type AudioFocusGraph,
+} from "@/lib/audio-focus";
 
 export type AgentState = "idle" | "listening" | "retrieving" | "thinking" | "speaking";
 
@@ -87,6 +94,8 @@ export function useVoiceAgentRTC() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const localAudioStreamRef = useRef<MediaStream | null>(null);
+  const processedAudioStreamRef = useRef<MediaStream | null>(null);
+  const audioFocusGraphRef = useRef<AudioFocusGraph | null>(null);
   const localVideoStreamRef = useRef<MediaStream | null>(null);
   const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -205,6 +214,10 @@ export function useVoiceAgentRTC() {
 
     localAudioStreamRef.current?.getTracks().forEach((t) => t.stop());
     localAudioStreamRef.current = null;
+    processedAudioStreamRef.current?.getTracks().forEach((t) => t.stop());
+    processedAudioStreamRef.current = null;
+    audioFocusGraphRef.current?.close();
+    audioFocusGraphRef.current = null;
     localVideoStreamRef.current?.getTracks().forEach((t) => t.stop());
     localVideoStreamRef.current = null;
 
@@ -232,14 +245,20 @@ export function useVoiceAgentRTC() {
     setConnecting(true);
 
     try {
+      let audioFocusEnabled = true;
+      try {
+        const sessionConfig = await apiFetch<{ audioFocusEnabled?: boolean }>("/api/v1/rtc/config");
+        if (typeof sessionConfig.audioFocusEnabled === "boolean") {
+          audioFocusEnabled = sessionConfig.audioFocusEnabled;
+        }
+      } catch {
+        audioFocusEnabled = true;
+      }
+
       let audioStream: MediaStream;
       try {
         audioStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
+          audio: buildMicrophoneConstraints(audioFocusEnabled),
         });
       } catch {
         setPermissionPrompt(
@@ -259,24 +278,25 @@ export function useVoiceAgentRTC() {
       if (AudioCtx) {
         const actx = new AudioCtx();
         audioCtxRef.current = actx;
-        const micSrc = actx.createMediaStreamSource(audioStream);
-        const micAnalyser = actx.createAnalyser();
-        micAnalyser.fftSize = 128;
-        micSrc.connect(micAnalyser);
+        const graph = createAudioFocusGraph(actx, audioStream, audioFocusEnabled);
+        audioFocusGraphRef.current = graph;
+        processedAudioStreamRef.current = graph.stream;
+
+        let micAnalyser = graph.analyser;
+        if (!micAnalyser) {
+          const micSrc = actx.createMediaStreamSource(audioStream);
+          micAnalyser = actx.createAnalyser();
+          micAnalyser.fftSize = 128;
+          micSrc.connect(micAnalyser);
+        }
         micAnalyserRef.current = micAnalyser;
 
         const tdBuf = new Uint8Array(micAnalyser.fftSize);
-        let speaking = false;
-        let lastSpeechAt = 0;
-        let loudTicks = 0;
-        const SPEECH_RMS = 0.03;
-        const START_TICKS = 3; // ~150ms sustained energy before we call it speech
-        const HANGOVER_MS = 900;
+        const vad = new AdaptiveVAD(audioFocusEnabled);
         vadIntervalRef.current = setInterval(() => {
           const dc = dcRef.current;
           if (!dc || dc.readyState !== "open" || !micStateRef.current) {
-            speaking = false;
-            loudTicks = 0;
+            setAudioFocusSpeechGate(graph, false, actx);
             return;
           }
           micAnalyser.getByteTimeDomainData(tdBuf);
@@ -287,21 +307,16 @@ export function useVoiceAgentRTC() {
           }
           const rms = Math.sqrt(sumSq / tdBuf.length);
           const now = performance.now();
-          if (rms > SPEECH_RMS) {
-            lastSpeechAt = now;
-            loudTicks++;
-            if (!speaking && loudTicks >= START_TICKS) {
-              speaking = true;
-              dc.send(JSON.stringify({ type: "vad.speech_start" }));
-            }
-          } else {
-            loudTicks = 0;
-            if (speaking && now - lastSpeechAt > HANGOVER_MS) {
-              speaking = false;
-              dc.send(JSON.stringify({ type: "vad.speech_end" }));
-            }
+          const decision = vad.update(rms, now);
+          setAudioFocusSpeechGate(graph, decision.speaking, actx);
+          if (decision.event === "start") {
+            dc.send(JSON.stringify({ type: "vad.speech_start" }));
+          } else if (decision.event === "end") {
+            dc.send(JSON.stringify({ type: "vad.speech_end" }));
           }
         }, 50);
+      } else {
+        processedAudioStreamRef.current = audioStream;
       }
 
       const tokenRes = await apiFetch<{ token: string }>("/api/v1/rtc/token", {
@@ -313,7 +328,8 @@ export function useVoiceAgentRTC() {
       });
       pcRef.current = pc;
 
-      audioStream.getTracks().forEach((track) => pc.addTrack(track, audioStream));
+      const outboundAudioStream = processedAudioStreamRef.current || audioStream;
+      outboundAudioStream.getTracks().forEach((track) => pc.addTrack(track, outboundAudioStream));
 
       pc.ontrack = (event) => {
         const [remoteStream] = event.streams;
@@ -393,6 +409,9 @@ export function useVoiceAgentRTC() {
     micStateRef.current = next;
     setMicEnabled(next);
     localAudioStreamRef.current?.getAudioTracks().forEach((t) => {
+      t.enabled = next;
+    });
+    processedAudioStreamRef.current?.getAudioTracks().forEach((t) => {
       t.enabled = next;
     });
     sendMediaToggle();

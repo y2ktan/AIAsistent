@@ -590,6 +590,7 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		APIKey             string  `json:"apiKey"`
 		RAGTopK            int     `json:"ragTopK"`
 		RAGMinSimilarity   float64 `json:"ragMinSimilarity"`
+		AudioFocusEnabled  *bool   `json:"audioFocusEnabled"`
 	}
 	if err := decodeStrictJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -641,6 +642,18 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 	if rec.RAGTopK <= 0 {
 		rec.RAGTopK = 5
 	}
+	existing, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
+		return
+	}
+	rec.AudioFocusEnabled = true
+	if existing != nil {
+		rec.AudioFocusEnabled = existing.AudioFocusEnabled
+	}
+	if req.AudioFocusEnabled != nil {
+		rec.AudioFocusEnabled = *req.AudioFocusEnabled
+	}
 
 	if strings.TrimSpace(req.APIKey) != "" {
 		ct, err := s.vault.Encrypt(req.APIKey)
@@ -656,7 +669,10 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save agent config"})
 		return
 	}
-	s.audit(r.Context(), r, "admin.agent_config.update", "agent_config", rec.ID, "success", map[string]any{"mode": rec.Mode})
+	s.audit(r.Context(), r, "admin.agent_config.update", "agent_config", rec.ID, "success", map[string]any{
+		"mode":              rec.Mode,
+		"audioFocusEnabled": rec.AudioFocusEnabled,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"config": rec})
 }
 
@@ -917,6 +933,15 @@ func (s *Server) HandleListAuditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"logs": logs})
 }
 
+func (s *Server) HandleRTCConfig(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load voice session config"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"audioFocusEnabled": cfg.AudioFocusEnabled})
+}
+
 func (s *Server) HandleRTCOffer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SignalingToken string `json:"signalingToken"`
@@ -1034,6 +1059,7 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 			APIKey:             apiKey,
 			RAGTopK:            cfgRec.RAGTopK,
 			RAGMinSimilarity:   cfgRec.RAGMinSimilarity,
+			AudioFocusEnabled:  cfgRec.AudioFocusEnabled,
 			AllowPrivate:       s.allowPrivate,
 			VoiceLanguages:     vl,
 		},

@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	SessionCookieName    = "aegis_session"
-	SessionIdleTimeout   = 30 * time.Minute
-	SessionMaxLifetime   = 12 * time.Hour
-	SignalingTokenTTL    = 60 * time.Second
+	SessionCookieName  = "aegis_session"
+	SessionIdleTimeout = 30 * time.Minute
+	SessionMaxLifetime = 12 * time.Hour
+	SignalingTokenTTL  = 60 * time.Second
 )
 
 type Config struct {
