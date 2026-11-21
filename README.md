@@ -9,7 +9,7 @@ Enterprise-grade, low-latency multimodal voice-and-vision AI assistant built wit
   - `/login` — Credential login and one-time initial administrator bootstrap flow.
   - `/admin` — Role-gated governance console for Users & Roles, RAG Knowledge Base, AI Agent Configuration (write-only encrypted secrets), MCP Servers, Agent Skills, and Security Audit Logs.
 - **Audio Focus** is enabled by default and can be toggled in **`/admin` → AI Agent**. It isolates near-field speech with browser voice-isolation capture hints, speech-band Web Audio filtering, adaptive ambient-noise VAD, and downstream gating before audio is sent over WebRTC. `realtime` sessions also request provider-side `near_field` input noise reduction.
-  - Authenticated callers receive only the non-secret `audioFocusEnabled` flag from `GET /api/v1/rtc/config`; provider credentials and full admin configuration remain admin-only.
+  - Authenticated callers receive only the non-secret `assistantName` and `audioFocusEnabled` fields from `GET /api/v1/rtc/config`; provider credentials and full admin configuration remain admin-only.
 - **`server/` (Go + Pion WebRTC)**:
   - DTLS-SRTP Opus audio & VP8/H.264 video tracks + ordered `events` SCTP data channel.
   - Dual-mode `SessionAgent` (`realtime` WebSocket bridge & `cascaded` OpenAI-compatible STT → Vision/RAG/Agent Skills/MCP LLM → Streaming TTS); skills are progressively loaded as playbooks and external operations remain restricted to allowlisted MCP tools.
@@ -75,6 +75,21 @@ Run `./setup-local-ai.sh` to configure the local AI stack. Its default LLM is `q
 ## Pion WebRTC UDP Mux Port Settings
 
 To avoid exposing thousands of ephemeral UDP ports in Docker, Pion's `SettingEngine` is configured with a single-port `ICEMux` (`ICE_UDP_MUX_PORT=8443` by default) and TCP ICE fallback on the same port (`8443/udp` and `8443/tcp` in `docker-compose.yml`). When deploying behind a cloud firewall or NAT, open `8443/udp` and `8443/tcp` and set `ICE_PUBLIC_IP` to your host's reachable public IP.
+
+## Wake-Name, Pause, and Direct-Question Voice Gating
+
+Voice sessions are designed for noisy rooms with background talkers and frequent thinking-out-loud pauses:
+
+- **Configurable Assistant Name & Wake Aliases (`/admin` → AI Agent)**:
+  - **Assistant Name** defaults to `Aegis` and can be customized to any non-empty English or Chinese name (up to 64 characters, such as `Jarvis` or `小智`).
+  - **Wake Aliases** accept optional comma-separated English or Chinese alternate names (for example `小智, Aegis`), with automatic Simplified/Traditional Chinese character equivalence and STT vocabulary hinting.
+  - The active primary `assistantName` is rendered on the `/` home page header and assistant transcript speaker badges.
+- **Strict Wake-Name Gate & Name-Verified Barge-In**:
+  - Speech that does not begin with a configured wake name or alias (optionally preceded by a brief greeting like `"hey"`, `"hi"`, `"喂"`, or `"你好"`) is silently discarded without interrupting active `retrieving`, `thinking`, or `speaking` states and without appearing in live captions.
+  - Interrupting an in-progress assistant reply (`barge_in`) requires addressing the assistant by a configured wake name or alias.
+- **Pause Tolerance & Direct-Question Gate**:
+  - Client and server VAD hold active speech segments across pauses up to `2.5s`, and wake-addressed statements remain armed silently for up to `15s` across multi-clause thinking pauses without emitting filler acknowledgements (`"got it"`, `"mm-hmm"`, `"okay"`).
+  - Both `cascaded` and `realtime` voice sessions generate a spoken reply only after the wake-addressed turn includes a direct question (English, Mandarin, Cantonese, or Malay).
 
 ## Voice Languages
 

@@ -20,6 +20,8 @@ import (
 	"aegis-voice/server/internal/rtc"
 	"aegis-voice/server/internal/security"
 	"aegis-voice/server/internal/skills"
+
+	"github.com/pion/webrtc/v4"
 )
 
 type mockAllStore struct {
@@ -42,7 +44,7 @@ func newMockAllStore() *mockAllStore {
 		signalingTokens: make(map[string]*auth.SignalingToken),
 		mcpServers:      make(map[string]*MCPServerRecord),
 		agentSkills:     make(map[string]*skills.Skill),
-		agentCfg:        &AgentConfigRecord{Name: "default", Mode: "cascaded", AudioFocusEnabled: true},
+		agentCfg:        &AgentConfigRecord{Name: "default", Mode: "cascaded", AudioFocusEnabled: true, AssistantName: "Aegis", WakeAliases: []string{}},
 	}
 }
 
@@ -193,6 +195,7 @@ func (m *mockAllStore) GetAgentConfig(_ context.Context) (*AgentConfigRecord, er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := *m.agentCfg
+	cp.WakeAliases = append([]string{}, m.agentCfg.WakeAliases...)
 	return &cp, nil
 }
 
@@ -205,6 +208,7 @@ func (m *mockAllStore) UpsertAgentConfig(_ context.Context, rec *AgentConfigReco
 		rec.APIKeyLast4 = m.agentCfg.APIKeyLast4
 	}
 	cp := *rec
+	cp.WakeAliases = append([]string{}, rec.WakeAliases...)
 	m.agentCfg = &cp
 	return nil
 }
@@ -606,8 +610,8 @@ func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {
 	req.AddCookie(adminCookie)
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || rec.Body.String() != "{\"audioFocusEnabled\":false}\n" {
-		t.Fatalf("expected authenticated rtc config with audioFocusEnabled=false, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || rec.Body.String() != "{\"assistantName\":\"Aegis\",\"audioFocusEnabled\":false}\n" {
+		t.Fatalf("expected authenticated rtc config with assistantName=Aegis and audioFocusEnabled=false, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// 4. Last-admin lockout protection returns 409 Conflict
@@ -906,5 +910,238 @@ func TestAdminProviderDiscoveryAPIs(t *testing.T) {
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("expected 403 for non-admin on %s, got %d %s", path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func TestAssistantWakeNameAdminAndRTCConfig(t *testing.T) {
+	store := newMockAllStore()
+	vault, _ := security.NewVault(make([]byte, 32))
+	authSvc := auth.NewService(store, auth.Config{
+		WebOrigin:           "https://aegis.local",
+		AdminBootstrapToken: "boot-123",
+	}, nil)
+	rtcMgr, _ := rtc.NewManager(rtc.Config{}, nil)
+	defer rtcMgr.Close()
+
+	router := NewServer(authSvc, store, store, rag.NewService(nil, 0), rtcMgr, mcp.NewHost(false), vault, false, nil).Router()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/bootstrap", bytes.NewBufferString(`{"bootstrapToken":"boot-123","email":"admin@aegis.local","password":"AdminPassword!2026"}`))
+	req.Header.Set("Origin", "https://aegis.local")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("bootstrap failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var bootResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &bootResp)
+	adminCookie := rec.Result().Cookies()[0]
+
+	sendAdmin := func(method, path, body string) *httptest.ResponseRecorder {
+		var r *http.Request
+		if body == "" {
+			r = httptest.NewRequest(method, path, nil)
+		} else {
+			r = httptest.NewRequest(method, path, bytes.NewBufferString(body))
+			r.Header.Set("Origin", "https://aegis.local")
+			r.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+		}
+		r.AddCookie(adminCookie)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return w
+	}
+
+	// 1. Default assistantName is "Aegis" with empty wakeAliases []
+	rec = sendAdmin(http.MethodGet, "/api/v1/admin/agent-config", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET agent-config failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"assistantName":"Aegis"`) || !strings.Contains(rec.Body.String(), `"wakeAliases":[]`) {
+		t.Fatalf("expected default assistantName=Aegis and empty wakeAliases=[], got: %s", rec.Body.String())
+	}
+
+	// 2. Save primary name + English/Chinese wakeAliases (trimmed + case/script deduplicated)
+	rec = sendAdmin(http.MethodPut, "/api/v1/admin/agent-config", `{
+		"mode": "cascaded",
+		"llmBaseUrl": "https://api.openai.com/v1",
+		"apiKey": "sk-secret-wake-1234",
+		"assistantName": "  Jarvis  ",
+		"wakeAliases": [" 小智 ", "Aegis", "小智", "jarvis", "", "贾维斯", "賈維斯"]
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT agent-config wake names failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var cfgResp struct {
+		Config AgentConfigRecord `json:"config"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &cfgResp); err != nil {
+		t.Fatal(err)
+	}
+	if cfgResp.Config.AssistantName != "Jarvis" {
+		t.Fatalf("expected trimmed assistantName Jarvis, got %q", cfgResp.Config.AssistantName)
+	}
+	wantAliases := []string{"小智", "Aegis", "贾维斯"}
+	if len(cfgResp.Config.WakeAliases) != len(wantAliases) {
+		t.Fatalf("expected deduplicated wakeAliases %v, got %v", wantAliases, cfgResp.Config.WakeAliases)
+	}
+	for i, wAlias := range wantAliases {
+		if cfgResp.Config.WakeAliases[i] != wAlias {
+			t.Fatalf("alias[%d]: expected %q, got %q", i, wAlias, cfgResp.Config.WakeAliases[i])
+		}
+	}
+
+	// 3. Omitting assistantName and wakeAliases preserves stored values
+	rec = sendAdmin(http.MethodPut, "/api/v1/admin/agent-config", `{"mode":"cascaded","llmBaseUrl":"https://api.openai.com/v1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT omitted wake fields failed: %d %s", rec.Code, rec.Body.String())
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &cfgResp)
+	if cfgResp.Config.AssistantName != "Jarvis" || len(cfgResp.Config.WakeAliases) != 3 {
+		t.Fatalf("expected omitted update to preserve Jarvis + 3 aliases, got %+v", cfgResp.Config)
+	}
+
+	// 4. Blank or oversized assistantName is rejected with 400 and leaves stored config unchanged
+	for _, invalidPayload := range []string{
+		`{"mode":"cascaded","assistantName":"   "}`,
+		`{"mode":"cascaded","assistantName":"` + strings.Repeat("智", 65) + `"}`,
+	} {
+		rec = sendAdmin(http.MethodPut, "/api/v1/admin/agent-config", invalidPayload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid assistantName payload %s, got %d %s", invalidPayload, rec.Code, rec.Body.String())
+		}
+	}
+	rec = sendAdmin(http.MethodGet, "/api/v1/admin/agent-config", "")
+	_ = json.Unmarshal(rec.Body.Bytes(), &cfgResp)
+	if cfgResp.Config.AssistantName != "Jarvis" {
+		t.Fatalf("expected failed validation to leave stored assistantName=Jarvis intact, got %q", cfgResp.Config.AssistantName)
+	}
+
+	// 5. Audit log records assistantName and wakeAliases
+	rec = sendAdmin(http.MethodGet, "/api/v1/admin/audit-logs", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"assistantName":"Jarvis"`) || !strings.Contains(rec.Body.String(), `"wakeAliases":["小智","Aegis","贾维斯"]`) {
+		t.Fatalf("expected audit log with assistantName and wakeAliases, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 6. Authenticated non-admin user retrieves safe assistantName via /api/v1/rtc/config without secrets
+	rec = sendAdmin(http.MethodPost, "/api/v1/admin/users", `{"email":"voiceuser@aegis.local","password":"UserPassword!2026","role":"user"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create user failed: %d %s", rec.Code, rec.Body.String())
+	}
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"email":"voiceuser@aegis.local","password":"UserPassword!2026"}`))
+	loginReq.Header.Set("Origin", "https://aegis.local")
+	loginRec := httptest.NewRecorder()
+	router.ServeHTTP(loginRec, loginReq)
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("user login failed: %d", loginRec.Code)
+	}
+	userCookie := loginRec.Result().Cookies()[0]
+
+	rtcReq := httptest.NewRequest(http.MethodGet, "/api/v1/rtc/config", nil)
+	rtcReq.AddCookie(userCookie)
+	rtcRec := httptest.NewRecorder()
+	router.ServeHTTP(rtcRec, rtcReq)
+	if rtcRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/rtc/config failed: %d %s", rtcRec.Code, rtcRec.Body.String())
+	}
+	if rtcRec.Body.String() != "{\"assistantName\":\"Jarvis\",\"audioFocusEnabled\":true}\n" {
+		t.Fatalf("expected safe rtc config payload, got: %s", rtcRec.Body.String())
+	}
+}
+
+func TestAttachSessionAgentSpeechStartDoesNotTriggerRawBargeIn(t *testing.T) {
+	aiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer aiSrv.Close()
+
+	store := newMockAllStore()
+	store.agentCfg.LLMBaseURL = aiSrv.URL
+	vault, _ := security.NewVault(make([]byte, 32))
+	authSvc := auth.NewService(store, auth.Config{WebOrigin: "https://aegis.local"}, nil)
+	rtcMgr, err := rtc.NewManager(rtc.Config{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rtcMgr.Close()
+
+	srv := NewServer(authSvc, store, store, rag.NewService(nil, 0), rtcMgr, mcp.NewHost(true), vault, true, nil)
+
+	clientPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = clientPC.Close() }()
+
+	dc, err := clientPC.CreateDataChannel("events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan rtc.Event, 16)
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		var ev rtc.Event
+		if err := json.Unmarshal(msg.Data, &ev); err == nil {
+			events <- ev
+		}
+	})
+
+	offer, err := clientPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gather := webrtc.GatheringCompletePromise(clientPC)
+	if err := clientPC.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	<-gather
+
+	ready := make(chan *rtc.PeerSession, 1)
+	_, answerSDP, err := rtcMgr.HandleOffer(context.Background(), "u-1", "s-1", clientPC.LocalDescription().SDP, func(ps *rtc.PeerSession) {
+		srv.attachSessionAgent(ps)
+		ready <- ps
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientPC.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); err != nil {
+		t.Fatal(err)
+	}
+
+	var serverPeer *rtc.PeerSession
+	select {
+	case serverPeer = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for attachSessionAgent")
+	}
+
+	// Drain initial listening event(s)
+	deadline := time.Now().Add(2 * time.Second)
+	sawListening := false
+	for time.Now().Before(deadline) && !sawListening {
+		select {
+		case ev := <-events:
+			if ev.Type == "state" && ev.State == "listening" {
+				sawListening = true
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !sawListening {
+		t.Fatal("expected initial listening state event")
+	}
+
+	// Raw vad.speech_start MUST NOT emit barge_in
+	if serverPeer.OnSpeechStart == nil {
+		t.Fatal("expected OnSpeechStart callback to be wired")
+	}
+	serverPeer.OnSpeechStart()
+
+	select {
+	case ev := <-events:
+		if ev.Type == "barge_in" {
+			t.Fatalf("expected raw OnSpeechStart not to trigger barge_in, got %+v", ev)
+		}
+	case <-time.After(150 * time.Millisecond):
 	}
 }

@@ -104,6 +104,8 @@ export function setAudioFocusSpeechGate(
   graph.gate.gain.setTargetAtTime(target, context.currentTime, speaking ? 0.008 : 0.04);
 }
 
+export const VAD_SPEECH_HOLD_MS = 2500;
+
 export class AdaptiveVAD {
   private noiseFloor = 0.015;
   private speaking = false;
@@ -111,7 +113,10 @@ export class AdaptiveVAD {
   private lastSpeechAt = 0;
   private calibrationTicks = 0;
 
-  constructor(private readonly enabled = true) {}
+  constructor(
+    private readonly enabled = true,
+    private readonly speechHoldMs = VAD_SPEECH_HOLD_MS
+  ) {}
 
   update(rms: number, nowMs: number): VADDecision {
     const startThreshold = this.enabled
@@ -141,7 +146,7 @@ export class AdaptiveVAD {
       }
     } else if (rms > holdThreshold) {
       this.lastSpeechAt = nowMs;
-    } else if (nowMs - this.lastSpeechAt >= 900) {
+    } else if (nowMs - this.lastSpeechAt >= this.speechHoldMs) {
       this.speaking = false;
       this.onsetTicks = 0;
       event = "end";

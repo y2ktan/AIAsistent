@@ -17,6 +17,7 @@ type TestMCPServer = {
 const mcpMocks = vi.hoisted(() => ({
   servers: [] as TestMCPServer[],
   updates: [] as { path: string; options?: RequestInit }[],
+  agentConfigSaves: [] as Record<string, unknown>[],
 }));
 
 vi.mock("next/navigation", () => {
@@ -37,6 +38,18 @@ vi.mock("@/lib/api-client", () => ({
     if (path.endsWith("/documents")) return { documents: [] };
     if (path.endsWith("/voice-languages")) {
       return { languages: [], defaultLanguage: "en", saved: true, catalog: [] };
+    }
+    if (options?.method === "PUT" && path.endsWith("/agent-config")) {
+      const body = JSON.parse(String(options.body)) as Record<string, unknown>;
+      mcpMocks.agentConfigSaves.push(body);
+      return {
+        config: {
+          mode: body.mode || "cascaded",
+          assistantName: body.assistantName,
+          wakeAliases: body.wakeAliases,
+          audioFocusEnabled: body.audioFocusEnabled,
+        },
+      };
     }
     if (options?.method === "PUT" && path.includes("/mcp-servers/")) {
       mcpMocks.updates.push({ path, options });
@@ -65,6 +78,7 @@ describe("admin form autofill settings", () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     mcpMocks.servers = [];
     mcpMocks.updates = [];
+    mcpMocks.agentConfigSaves = [];
   });
 
   afterEach(async () => {
@@ -136,6 +150,68 @@ describe("admin form autofill settings", () => {
     const audioFocusCheckbox = Array.from(container.querySelectorAll<HTMLInputElement>("input[type='checkbox']"))
       .find((input) => input.closest("label")?.textContent?.includes("Audio Focus"));
     expect(audioFocusCheckbox?.checked).toBe(true);
+
+    const assistantNameInput = container.querySelector<HTMLInputElement>(
+      'input[name="assistant-name"]'
+    );
+    const wakeAliasesInput = container.querySelector<HTMLInputElement>(
+      'input[name="wake-aliases"]'
+    );
+    expect(assistantNameInput?.value).toBe("Aegis");
+    expect(assistantNameInput?.getAttribute("autocomplete")).toBe("off");
+    expect(wakeAliasesInput?.value).toBe("");
+    expect(wakeAliasesInput?.getAttribute("autocomplete")).toBe("off");
+  });
+
+  it("submits English and Chinese assistantName and wakeAliases from AI Agent settings", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(createElement(AdminPage));
+    });
+
+    const agentTab = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("AI Agent")
+    );
+    await act(async () => {
+      agentTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const assistantNameInput = container.querySelector<HTMLInputElement>(
+      'input[name="assistant-name"]'
+    );
+    const wakeAliasesInput = container.querySelector<HTMLInputElement>(
+      'input[name="wake-aliases"]'
+    );
+    expect(assistantNameInput).toBeDefined();
+    expect(wakeAliasesInput).toBeDefined();
+
+    const setNativeValue = (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value"
+      )?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+
+    await act(async () => {
+      setNativeValue(assistantNameInput!, "Jarvis");
+      setNativeValue(wakeAliasesInput!, "小智， Aegis, 阿智");
+    });
+
+    const agentForm = assistantNameInput!.closest("form");
+    await act(async () => {
+      agentForm?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+
+    expect(mcpMocks.agentConfigSaves).toHaveLength(1);
+    expect(mcpMocks.agentConfigSaves[0]).toMatchObject({
+      assistantName: "Jarvis",
+      wakeAliases: ["小智", "Aegis", "阿智"],
+    });
   });
 
   it("hides discovered tools per server without changing server cards or allowlists", async () => {

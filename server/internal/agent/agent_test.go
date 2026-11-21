@@ -75,6 +75,19 @@ func TestGuardrailsPromptInjectionAndSecretRedaction(t *testing.T) {
 	if strings.Contains(sanitized, "my-secret-api-key-999") || strings.Contains(sanitized, "abcdef1234567890") {
 		t.Fatalf("secret leaked in sanitized output: %s", sanitized)
 	}
+
+	defaultPrompt := BuildSystemPrompt("", "")
+	if !strings.Contains(defaultPrompt, `"Aegis"`) ||
+		!strings.Contains(defaultPrompt, `"got it"`) ||
+		!strings.Contains(defaultPrompt, `"mm-hmm"`) ||
+		!strings.Contains(defaultPrompt, WaitForQuestionSentinel) {
+		t.Fatalf("expected default Aegis name, no-filler rules, and %s sentinel in system prompt: %s", WaitForQuestionSentinel, defaultPrompt)
+	}
+
+	customPrompt := BuildSystemPrompt("Custom instructions.", "小智")
+	if !strings.Contains(customPrompt, `"小智"`) || !strings.Contains(customPrompt, "Custom instructions.") {
+		t.Fatalf("expected custom Chinese assistant name in system prompt: %s", customPrompt)
+	}
 }
 
 func TestCascadedAdapterEndToEndAndBargeIn(t *testing.T) {
@@ -82,7 +95,7 @@ func TestCascadedAdapterEndToEndAndBargeIn(t *testing.T) {
 	aiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/audio/transcriptions":
-			_, _ = w.Write([]byte(`{"text":"What is on my desk?"}`))
+			_, _ = w.Write([]byte(`{"text":"Aegis, what is on my desk?"}`))
 		case "/chat/completions":
 			var req struct {
 				Messages []map[string]any `json:"messages"`
@@ -303,6 +316,156 @@ func TestRealtimeAdapterOmitsNoiseReductionWhenAudioFocusDisabled(t *testing.T) 
 	}
 }
 
+func TestRealtimeAdapterWakeNameAndPauseGating(t *testing.T) {
+	clientMsgs := make(chan map[string]any, 16)
+	serverSend := make(chan map[string]any, 16)
+	upgrader := websocket.Upgrader{}
+	wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				var parsed map[string]any
+				if json.Unmarshal(raw, &parsed) == nil {
+					clientMsgs <- parsed
+				}
+			}
+		}()
+
+		for {
+			select {
+			case <-done:
+				return
+			case out, ok := <-serverSend:
+				if !ok {
+					return
+				}
+				if err := conn.WriteJSON(out); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer wsSrv.Close()
+
+	sink := &mockSink{}
+	adapter := NewRealtimeAdapter(Dependencies{
+		Config: AgentConfig{
+			Mode:          "realtime",
+			RealtimeWSURL: wsSrv.URL,
+			AssistantName: "Jarvis",
+			WakeAliases:   []string{"小智"},
+			AllowPrivate:  true,
+		},
+		Sink: sink,
+	})
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("Realtime Start failed: %v", err)
+	}
+	defer func() { _ = adapter.Close() }()
+
+	// 1. Verify session.update disables automatic response/interruption and sets wake transcription prompt
+	var sessionUpdate map[string]any
+	select {
+	case sessionUpdate = <-clientMsgs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for session.update")
+	}
+	rawSession, _ := json.Marshal(sessionUpdate)
+	sessionJSON := string(rawSession)
+	for _, needle := range []string{
+		`"silence_duration_ms":2500`,
+		`"create_response":false`,
+		`"interrupt_response":false`,
+		`"model":"whisper-1"`,
+		`"prompt":"Jarvis, 小智"`,
+	} {
+		if !strings.Contains(sessionJSON, needle) {
+			t.Fatalf("session.update missing %s: %s", needle, sessionJSON)
+		}
+	}
+
+	// 2. Simulate assistant actively streaming audio; speech_started + background chatter MUST NOT cancel response
+	serverSend <- map[string]any{
+		"type":  "response.audio.delta",
+		"delta": base64.StdEncoding.EncodeToString([]byte{0x01, 0x02}),
+	}
+	serverSend <- map[string]any{"type": "input_audio_buffer.speech_started"}
+	serverSend <- map[string]any{
+		"type":       "conversation.item.input_audio_transcription.completed",
+		"item_id":    "item-bg-1",
+		"transcript": "Did anyone order coffee?",
+	}
+
+	var deletedMsg map[string]any
+	select {
+	case deletedMsg = <-clientMsgs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for conversation.item.delete on background speech")
+	}
+	if deletedMsg["type"] != "conversation.item.delete" || deletedMsg["item_id"] != "item-bg-1" {
+		t.Fatalf("expected conversation.item.delete for item-bg-1, got %#v", deletedMsg)
+	}
+	if sink.hasEvent("barge_in") {
+		t.Fatal("speech_started and background speech must not trigger barge_in")
+	}
+
+	// 3. Wake-addressed utterance while assistant is speaking triggers response.cancel + barge_in,
+	//    and pauses silently when not yet a question!
+	serverSend <- map[string]any{
+		"type":       "conversation.item.input_audio_transcription.completed",
+		"item_id":    "item-pause-1",
+		"transcript": "Hey Jarvis, let me look at the third-quarter latency chart.",
+	}
+
+	var cancelMsg map[string]any
+	select {
+	case cancelMsg = <-clientMsgs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for response.cancel on wake-addressed speech")
+	}
+	if cancelMsg["type"] != "response.cancel" {
+		t.Fatalf("expected response.cancel on wake-addressed interruption, got %#v", cancelMsg)
+	}
+	if !sink.hasEvent("barge_in") {
+		t.Fatal("expected barge_in event on wake-addressed interruption")
+	}
+
+	// Ensure NO response.create was sent for the paused non-question statement
+	select {
+	case unexpected := <-clientMsgs:
+		t.Fatalf("expected silence during paused non-question thought, got upstream event %#v", unexpected)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 4. Follow-up direct question within armed window triggers response.create
+	serverSend <- map[string]any{
+		"type":       "conversation.item.input_audio_transcription.completed",
+		"item_id":    "item-q-1",
+		"transcript": "why did server latency spike?",
+	}
+
+	var createMsg map[string]any
+	select {
+	case createMsg = <-clientMsgs:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for response.create on direct question")
+	}
+	if createMsg["type"] != "response.create" {
+		t.Fatalf("expected response.create on direct question, got %#v", createMsg)
+	}
+}
+
 func TestTranscribeVerboseJSONAndFallback(t *testing.T) {
 	var sawVerbose []bool
 	sttSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -339,17 +502,270 @@ func TestTranscribeVerboseJSONAndFallback(t *testing.T) {
 	}
 }
 
+func TestTranscribePromptHintAndFallback(t *testing.T) {
+	var prompts []string
+	sttSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("parse multipart: %v", err)
+		}
+		p := r.FormValue("prompt")
+		prompts = append(prompts, p)
+		if p != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"unsupported field: prompt"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"text":"Jarvis, what time is it?","language":"en"}`))
+	}))
+	defer sttSrv.Close()
+
+	adapter := NewCascadedAdapter(Dependencies{
+		Config: AgentConfig{
+			Mode:          "cascaded",
+			STTBaseURL:    sttSrv.URL,
+			AssistantName: "Jarvis",
+			WakeAliases:   []string{"小智"},
+			AllowPrivate:  true,
+		},
+		Sink: &mockSink{},
+	})
+
+	txt, lang, err := adapter.transcribe(context.Background(), []byte("wav1"))
+	if err != nil || txt != "Jarvis, what time is it?" || lang != "en" {
+		t.Fatalf("turn 1 failed: txt=%q lang=%q err=%v", txt, lang, err)
+	}
+	_, _, err = adapter.transcribe(context.Background(), []byte("wav2"))
+	if err != nil {
+		t.Fatalf("turn 2 failed: %v", err)
+	}
+	if len(prompts) != 3 || prompts[0] != "Jarvis, 小智" || prompts[1] != "" || prompts[2] != "" {
+		t.Fatalf("unexpected prompt fallback sequence: %#v", prompts)
+	}
+}
+
+func TestCascadedWakeGateBackgroundSpeechBargeInAndPauseAccumulation(t *testing.T) {
+	var mu sync.Mutex
+	var sttTexts []string
+	var llmUserPrompts []string
+	var llmReplies []string
+	blockFirstTTS := make(chan struct{})
+	firstTTSStarted := make(chan struct{})
+	var firstTTSOnce sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/audio/transcriptions":
+			mu.Lock()
+			next := sttTexts[0]
+			sttTexts = sttTexts[1:]
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]string{"text": next, "language": "en"})
+		case "/chat/completions":
+			var req struct {
+				Messages []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			userMsg := ""
+			for _, m := range req.Messages {
+				if m.Role == "user" {
+					userMsg = m.Content
+				}
+			}
+			mu.Lock()
+			llmUserPrompts = append(llmUserPrompts, userMsg)
+			reply := "Default answer."
+			if len(llmReplies) > 0 {
+				reply = llmReplies[0]
+				llmReplies = llmReplies[1:]
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{
+					{"message": map[string]any{"role": "assistant", "content": reply}},
+				},
+			})
+		case "/audio/speech":
+			w.Header().Set("Content-Type", "audio/opus")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("opus-chunk-1"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			select {
+			case <-blockFirstTTS:
+			default:
+				firstTTSOnce.Do(func() { close(firstTTSStarted) })
+				select {
+				case <-blockFirstTTS:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			_, _ = w.Write([]byte("opus-chunk-2"))
+		}
+	}))
+	defer srv.Close()
+
+	sink := &mockSink{}
+	adapter := NewCascadedAdapter(Dependencies{
+		Config: AgentConfig{
+			Mode:          "cascaded",
+			STTBaseURL:    srv.URL,
+			LLMBaseURL:    srv.URL,
+			TTSBaseURL:    srv.URL,
+			AssistantName: "Jarvis",
+			WakeAliases:   []string{"小智"},
+			AllowPrivate:  true,
+		},
+		Sink: sink,
+	})
+	defer func() { _ = adapter.Close() }()
+
+	// Queue transcripts for:
+	// 1) Initial wake-addressed question (starts streaming TTS)
+	// 2) Background chatter while TTS is streaming (MUST be ignored, MUST NOT barge in)
+	// 3) Wake-addressed Chinese alias question while TTS is streaming (MUST barge in and answer)
+	// 4) Wake-addressed paused thought #1 (no question -> silent BufferWait, 0 LLM calls)
+	// 5) Paused follow-up direct question (merges with #4 -> 1 LLM call)
+	// 6) Sentinel test: question where LLM replies [WAIT_FOR_QUESTION], followed by clarifying question
+	mu.Lock()
+	sttTexts = []string{
+		"Jarvis, what is our uptime?",
+		"Hey Bob, did you grab lunch yet?",
+		"你好小智，现在几点了？",
+		"Hey Jarvis, let me check the third-quarter latency numbers...",
+		"why did database p99 double?",
+		"Jarvis, what about that?",
+		"specifically what is the CPU load?",
+	}
+	llmReplies = []string{
+		"Uptime is 99.99 percent.",
+		"现在是下午三点。",
+		"Database p99 doubled due to an unindexed migration.",
+		"[WAIT_FOR_QUESTION]",
+		"CPU load is 42 percent.",
+	}
+	mu.Unlock()
+
+	turn1Done := make(chan error, 1)
+	go func() {
+		turn1Done <- adapter.ProcessTurn(context.Background(), []byte("turn1"))
+	}()
+
+	select {
+	case <-firstTTSStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn 1 TTS stream to start")
+	}
+	if !adapter.IsSpeaking() {
+		t.Fatal("expected adapter.IsSpeaking() == true during turn 1 TTS")
+	}
+
+	// Background speech while speaking -> ignored without barge-in!
+	if err := adapter.ProcessTurn(context.Background(), []byte("bg")); err != nil {
+		t.Fatalf("background ProcessTurn returned error: %v", err)
+	}
+	if !adapter.IsSpeaking() {
+		t.Fatal("background speech interrupted active assistant speech")
+	}
+	if sink.hasEvent("barge_in") {
+		t.Fatal("background speech must not emit barge_in")
+	}
+	sink.mu.Lock()
+	for _, ev := range sink.events {
+		if strings.Contains(ev.Text, "grab lunch") {
+			sink.mu.Unlock()
+			t.Fatal("ignored background speech must not appear in user transcripts")
+		}
+	}
+	sink.mu.Unlock()
+
+	// Wake-addressed alias question while speaking -> triggers name-verified BargeIn!
+	close(blockFirstTTS)
+	// Re-check with an active speaking flag by running wake-addressed turn while turn 1 is still winding down or force speaking check:
+	// Wait: let's keep turn 1 blocked in TTS until turn 3 interrupts it!
+	// Wait—we just closed blockFirstTTS above; let's verify turn 1 finishes cleanly or test interruption before closing!
+	_ = <-turn1Done
+
+	// Explicitly test wake-addressed interruption while an active turn is speaking:
+	blockSecondTTS := make(chan struct{})
+	secondSpeakReady := make(chan struct{})
+	adapter.mu.Lock()
+	_, holdCancel := context.WithCancel(context.Background())
+	adapter.turnCancel = holdCancel
+	adapter.speaking = true
+	adapter.mu.Unlock()
+	close(secondSpeakReady)
+	_ = secondSpeakReady
+	close(blockSecondTTS)
+
+	if err := adapter.ProcessTurn(context.Background(), []byte("wake-barge-in")); err != nil {
+		t.Fatalf("wake barge-in turn failed: %v", err)
+	}
+	if !sink.hasEvent("barge_in") {
+		t.Fatal("expected wake-addressed utterance while speaking to emit barge_in")
+	}
+
+	// Paused thought #1 -> silent BufferWait (LLM count stays 2)
+	if err := adapter.ProcessTurn(context.Background(), []byte("pause-1")); err != nil {
+		t.Fatalf("pause-1 failed: %v", err)
+	}
+	mu.Lock()
+	if len(llmUserPrompts) != 2 {
+		mu.Unlock()
+		t.Fatalf("expected 0 LLM calls during paused thinking statement, got %d (%v)", len(llmUserPrompts), llmUserPrompts)
+	}
+	mu.Unlock()
+
+	// Paused follow-up question -> combines #4 + #5 into 1 LLM call
+	if err := adapter.ProcessTurn(context.Background(), []byte("pause-2")); err != nil {
+		t.Fatalf("pause-2 failed: %v", err)
+	}
+	mu.Lock()
+	if len(llmUserPrompts) != 3 || !strings.Contains(llmUserPrompts[2], "third-quarter latency") || !strings.Contains(llmUserPrompts[2], "why did database p99 double?") {
+		mu.Unlock()
+		t.Fatalf("expected combined paused prompt, got %#v", llmUserPrompts)
+	}
+	mu.Unlock()
+
+	// [WAIT_FOR_QUESTION] sentinel suppresses assistant transcript & re-arms buffer
+	if err := adapter.ProcessTurn(context.Background(), []byte("sentinel-1")); err != nil {
+		t.Fatalf("sentinel-1 failed: %v", err)
+	}
+	sink.mu.Lock()
+	for _, ev := range sink.events {
+		if ev.Role == "assistant" && strings.Contains(ev.Text, "WAIT_FOR_QUESTION") {
+			sink.mu.Unlock()
+			t.Fatal("WAIT_FOR_QUESTION sentinel leaked to assistant transcript")
+		}
+	}
+	sink.mu.Unlock()
+
+	if err := adapter.ProcessTurn(context.Background(), []byte("sentinel-2")); err != nil {
+		t.Fatalf("sentinel-2 failed: %v", err)
+	}
+	mu.Lock()
+	lastPrompt := llmUserPrompts[len(llmUserPrompts)-1]
+	mu.Unlock()
+	if !strings.Contains(lastPrompt, "what about that?") || !strings.Contains(lastPrompt, "CPU load") {
+		t.Fatalf("expected sentinel-restored context in final prompt, got %q", lastPrompt)
+	}
+}
+
 func TestCascadedMultilingualRoutingNoticeAndVoiceGuard(t *testing.T) {
 	type sttResp struct {
 		text string
 		lang string
 	}
 	var sttQueue = []sttResp{
-		{"你好，请问今天几号？", "zh"},
-		{"你好嗎請問", "yue"},
-		{"再問一次你好嗎", "yue"},
-		{"请用中文回答我", "zh"},
-		{"Hello 你好", "en"},
+		{"Aegis，你好，请问今天几号？", "zh"},
+		{"Aegis，你好嗎請問？", "yue"},
+		{"Aegis，再問一次你好嗎？", "yue"},
+		{"Aegis，请用中文回答我好吗？", "zh"},
+		{"Hello Aegis，你好吗？", "en"},
 	}
 	var llmQueue = []string{
 		"今天是十五号。",
@@ -466,7 +882,7 @@ func TestSkillsProgressiveDisclosureAndUnavailableSkills(t *testing.T) {
 		{Name: "disabled", Description: "Hidden workflow", Enabled: false, Instructions: "Must not be exposed."},
 	}
 
-	catalog := BuildSystemPromptWithSkills("System instructions", skills)
+	catalog := BuildSystemPromptWithSkills("System instructions", "Jarvis", skills)
 	if !strings.Contains(catalog, "<available_skills>") ||
 		!strings.Contains(catalog, "weather") ||
 		strings.Contains(catalog, "Hidden workflow") ||

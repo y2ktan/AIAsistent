@@ -23,12 +23,35 @@ type RealtimeAdapter struct {
 	writeMu           sync.Mutex
 	conn              *websocket.Conn
 	cancel            context.CancelFunc
+	wakeGate          *WakeTurnGate
+	bufferedItemIDs   []string
+	speaking          bool
+	responseActive    bool
 	toolCallsThisTurn int
 	toolLimitNotified bool
 }
 
 func NewRealtimeAdapter(deps Dependencies) *RealtimeAdapter {
-	return &RealtimeAdapter{deps: deps}
+	gate := NewWakeTurnGate(DefaultWakeWindow)
+	r := &RealtimeAdapter{
+		deps:     deps,
+		wakeGate: gate,
+	}
+	gate.SetOnExpire(func() {
+		r.mu.Lock()
+		expiredIDs := append([]string(nil), r.bufferedItemIDs...)
+		r.bufferedItemIDs = nil
+		r.mu.Unlock()
+		for _, id := range expiredIDs {
+			if id != "" {
+				_ = r.writeJSON(map[string]any{
+					"type":    "conversation.item.delete",
+					"item_id": id,
+				})
+			}
+		}
+	})
+	return r
 }
 
 func (r *RealtimeAdapter) Start(ctx context.Context) error {
@@ -132,9 +155,20 @@ func (r *RealtimeAdapter) sendSessionUpdate() error {
 	}
 	langPolicy := "\n\nLANGUAGE POLICY:\n- Supported spoken reply languages: " + strings.Join(voicedNames, ", ") + ".\n- Default language: " + defName + ".\n- Always reply in the language of the user's most recent utterance if it is in the supported spoken list. If the language of an utterance cannot be determined, reply in the language of your previous reply in this session, or in " + defName + " if there is no previous reply. Otherwise, interpret their message as well as you can, reply in " + defName + ", and tell them once per session (without repeating) that you cannot reply in that language yet."
 
+	wakePrompt := BuildWakeVocabularyPrompt(r.deps.Config.AssistantName, r.deps.Config.WakeAliases)
 	session := map[string]any{
-		"instructions": BuildSystemPromptWithSkills(r.deps.Config.SystemInstructions, r.deps.Skills) + langPolicy,
+		"instructions": BuildSystemPromptWithSkills(r.deps.Config.SystemInstructions, r.deps.Config.AssistantName, r.deps.Skills) + langPolicy,
 		"tools":        tools,
+		"turn_detection": map[string]any{
+			"type":                "server_vad",
+			"silence_duration_ms": 2500,
+			"create_response":     false,
+			"interrupt_response":  false,
+		},
+		"input_audio_transcription": map[string]any{
+			"model":  "whisper-1",
+			"prompt": wakePrompt,
+		},
 	}
 	if r.deps.Config.AudioFocusEnabled {
 		session["input_audio_noise_reduction"] = map[string]any{"type": "near_field"}
@@ -154,16 +188,32 @@ func (r *RealtimeAdapter) SendAudioBase64(b64Audio string) error {
 }
 
 func (r *RealtimeAdapter) BargeIn() {
+	r.mu.Lock()
+	r.speaking = false
+	r.responseActive = false
+	r.mu.Unlock()
 	_ = r.writeJSON(map[string]any{"type": "response.cancel"})
 	r.deps.Sink.SendEvent(rtc.NewBargeInEvent())
 }
 
+func (r *RealtimeAdapter) isActiveOrSpeaking() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.speaking || r.responseActive
+}
+
 func (r *RealtimeAdapter) Close() error {
+	if r.wakeGate != nil {
+		r.wakeGate.Close()
+	}
 	r.mu.Lock()
 	cancel := r.cancel
 	conn := r.conn
 	r.conn = nil
 	r.cancel = nil
+	r.speaking = false
+	r.responseActive = false
+	r.bufferedItemIDs = nil
 	r.mu.Unlock()
 
 	if cancel != nil {
@@ -208,11 +258,13 @@ func (r *RealtimeAdapter) readLoop(ctx context.Context) {
 		}
 
 		var ev struct {
-			Type      string `json:"type"`
-			Delta     string `json:"delta"`
-			CallID    string `json:"call_id"`
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
+			Type       string `json:"type"`
+			Delta      string `json:"delta"`
+			CallID     string `json:"call_id"`
+			Name       string `json:"name"`
+			Arguments  string `json:"arguments"`
+			ItemID     string `json:"item_id"`
+			Transcript string `json:"transcript"`
 		}
 		if err := json.Unmarshal(msg, &ev); err != nil {
 			continue
@@ -220,12 +272,19 @@ func (r *RealtimeAdapter) readLoop(ctx context.Context) {
 
 		switch ev.Type {
 		case "input_audio_buffer.speech_started":
-			r.resetToolCallBudget()
-			r.BargeIn()
-			r.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+			// Do not auto-interrupt on raw VAD onset; wait for input transcription to verify wake name.
+			if !r.isActiveOrSpeaking() {
+				r.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+			}
+		case "conversation.item.input_audio_transcription.completed":
+			r.handleCompletedTranscription(ev.ItemID, ev.Transcript)
 		case "response.audio.delta":
 			if ev.Delta != "" {
 				if decoded, err := base64.StdEncoding.DecodeString(ev.Delta); err == nil {
+					r.mu.Lock()
+					r.speaking = true
+					r.responseActive = true
+					r.mu.Unlock()
 					r.deps.Sink.SendEvent(rtc.NewStateEvent("speaking"))
 					_ = r.deps.Sink.WriteAudioSample(decoded, 20*time.Millisecond)
 				}
@@ -233,7 +292,9 @@ func (r *RealtimeAdapter) readLoop(ctx context.Context) {
 		case "response.audio_transcript.delta":
 			if ev.Delta != "" {
 				clean := SanitizeAssistantOutput(ev.Delta, []string{r.deps.Config.APIKey})
-				r.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.delta", "assistant", clean))
+				if !IsWaitForQuestionReply(clean) {
+					r.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.delta", "assistant", clean))
+				}
 			}
 		case "response.function_call_arguments.done":
 			if !r.reserveToolCall() {
@@ -242,8 +303,72 @@ func (r *RealtimeAdapter) readLoop(ctx context.Context) {
 			}
 			go r.handleToolCall(ctx, ev.CallID, ev.Name, ev.Arguments)
 		case "response.done":
+			r.mu.Lock()
+			r.speaking = false
+			r.responseActive = false
+			r.mu.Unlock()
 			r.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
 		}
+	}
+}
+
+func (r *RealtimeAdapter) handleCompletedTranscription(itemID, rawTranscript string) {
+	text := strings.TrimSpace(rawTranscript)
+	if text == "" {
+		if itemID != "" {
+			_ = r.writeJSON(map[string]any{
+				"type":    "conversation.item.delete",
+				"item_id": itemID,
+			})
+		}
+		return
+	}
+
+	r.mu.Lock()
+	if r.wakeGate == nil {
+		r.wakeGate = NewWakeTurnGate(DefaultWakeWindow)
+	}
+	gate := r.wakeGate
+	r.mu.Unlock()
+
+	res := gate.Evaluate(text, r.deps.Config.AssistantName, r.deps.Config.WakeAliases)
+	switch res.Action {
+	case WakeActionIgnore:
+		if itemID != "" {
+			_ = r.writeJSON(map[string]any{
+				"type":    "conversation.item.delete",
+				"item_id": itemID,
+			})
+		}
+		return
+	case WakeActionBufferWait:
+		if itemID != "" {
+			r.mu.Lock()
+			r.bufferedItemIDs = append(r.bufferedItemIDs, itemID)
+			r.mu.Unlock()
+		}
+		if res.WakeMatched && r.isActiveOrSpeaking() {
+			r.BargeIn()
+		}
+		r.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "user", text))
+		if !r.isActiveOrSpeaking() {
+			r.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		}
+		return
+	case WakeActionRespond:
+		r.mu.Lock()
+		r.bufferedItemIDs = nil
+		r.mu.Unlock()
+		if r.isActiveOrSpeaking() {
+			r.BargeIn()
+		}
+		r.resetToolCallBudget()
+		r.mu.Lock()
+		r.responseActive = true
+		r.mu.Unlock()
+		r.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "user", text))
+		r.deps.Sink.SendEvent(rtc.NewStateEvent("thinking"))
+		_ = r.writeJSON(map[string]any{"type": "response.create"})
 	}
 }
 

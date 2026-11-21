@@ -52,6 +52,8 @@ interface DocRecord {
 
 interface AgentConfig {
   mode: "cascaded" | "realtime";
+  assistantName: string;
+  wakeAliases: string[];
   realtimeWsUrl: string;
   realtimeModel: string;
   sttBaseUrl: string;
@@ -69,6 +71,13 @@ interface AgentConfig {
   ragTopK: number;
   ragMinSimilarity: number;
   audioFocusEnabled: boolean;
+}
+
+function parseWakeAliasesInput(raw: string): string[] {
+  return raw
+    .split(/[,，、\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 interface TTSVoiceDiscovery {
@@ -123,6 +132,8 @@ export default function AdminPage() {
   // Agent config state
   const [cfg, setCfg] = useState<AgentConfig>({
     mode: "cascaded",
+    assistantName: "Aegis",
+    wakeAliases: [],
     realtimeWsUrl: "",
     realtimeModel: "",
     sttBaseUrl: "",
@@ -141,6 +152,7 @@ export default function AdminPage() {
     ragMinSimilarity: 0.35,
     audioFocusEnabled: true,
   });
+  const [wakeAliasesInput, setWakeAliasesInput] = useState("");
   const [newApiKey, setNewApiKey] = useState("");
   const [testingConn, setTestingConn] = useState(false);
   const [ttsVoiceDiscovery, setTTSVoiceDiscovery] = useState<TTSVoiceDiscovery>({
@@ -211,7 +223,20 @@ export default function AdminPage() {
       ]);
       setUsers(uRes.users || []);
       setDocs(dRes.documents || []);
-      if (cRes.config) setCfg(cRes.config);
+      if (cRes.config) {
+        const loadedAssistantName =
+          typeof cRes.config.assistantName === "string" && cRes.config.assistantName.trim() !== ""
+            ? cRes.config.assistantName
+            : "Aegis";
+        const loadedAliases = Array.isArray(cRes.config.wakeAliases) ? cRes.config.wakeAliases : [];
+        setCfg((prev) => ({
+          ...prev,
+          ...cRes.config,
+          assistantName: loadedAssistantName,
+          wakeAliases: loadedAliases,
+        }));
+        setWakeAliasesInput(loadedAliases.join(", "));
+      }
       if (vlRes) {
         setVoiceLangs(vlRes);
         const avail = availableCatalogLanguages(vlRes.languages || [], vlRes.catalog || []);
@@ -346,6 +371,8 @@ export default function AdminPage() {
     try {
       const payload = {
         mode: cfg.mode,
+        assistantName: cfg.assistantName,
+        wakeAliases: parseWakeAliasesInput(wakeAliasesInput),
         realtimeWsUrl: cfg.realtimeWsUrl,
         realtimeModel: cfg.realtimeModel,
         sttBaseUrl: cfg.sttBaseUrl,
@@ -368,7 +395,16 @@ export default function AdminPage() {
         method: "PUT",
         body: JSON.stringify(payload),
       });
-      setCfg(res.config);
+      if (res?.config) {
+        const savedAliases = Array.isArray(res.config.wakeAliases) ? res.config.wakeAliases : [];
+        setCfg((prev) => ({
+          ...prev,
+          ...res.config,
+          assistantName: res.config.assistantName || "Aegis",
+          wakeAliases: savedAliases,
+        }));
+        setWakeAliasesInput(savedAliases.join(", "));
+      }
       setNewApiKey("");
       setNotice({ type: "ok", text: "AI Agent configuration saved and encrypted." });
       try {
@@ -806,6 +842,49 @@ export default function AdminPage() {
             className="space-y-5 rounded-2xl border border-slate-800 bg-slate-900/50 p-6"
           >
             <div className="grid gap-4 md:grid-cols-2">
+              <div>
+                <label
+                  htmlFor="assistant-name"
+                  className="mb-1 block text-xs uppercase text-slate-400"
+                >
+                  Assistant Name
+                </label>
+                <input
+                  id="assistant-name"
+                  name="assistant-name"
+                  type="text"
+                  autoComplete="off"
+                  value={cfg.assistantName}
+                  onChange={(e) => setCfg({ ...cfg, assistantName: e.target.value })}
+                  placeholder="Aegis / 小智"
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                />
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Primary wake name required at the start of voice turns (English or Chinese, e.g. Aegis, Jarvis, 小智).
+                </p>
+              </div>
+              <div>
+                <label
+                  htmlFor="wake-aliases"
+                  className="mb-1 block text-xs uppercase text-slate-400"
+                >
+                  Wake Aliases
+                </label>
+                <input
+                  id="wake-aliases"
+                  name="wake-aliases"
+                  type="text"
+                  autoComplete="off"
+                  value={wakeAliasesInput}
+                  onChange={(e) => setWakeAliasesInput(e.target.value)}
+                  placeholder="Optional comma-separated aliases, e.g. 小智, Aegis"
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                />
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Optional alternate wake names in English or Chinese separated by commas.
+                </p>
+              </div>
+
               <div>
                 <label className="mb-1 block text-xs uppercase text-slate-400">Pipeline Mode</label>
                 <select

@@ -28,6 +28,17 @@ The system SHALL provide prominent, keyboard-accessible controls on the home pag
 - **WHEN** the browser blocks media device access
 - **THEN** the interface displays an inline, non-crashing recovery prompt explaining how to re-enable device permissions
 
+### Requirement: Configured assistant identity display and clean gated captions
+The system SHALL display the active configured assistant name on the home page header and assistant transcript speaker labels, and SHALL omit unaddressed background speech discarded by the wake-name gate from live conversation captions.
+
+#### Scenario: Home page renders custom configured assistant name
+- **WHEN** an administrator has configured a custom primary assistant name (such as `Jarvis` or `小智`) and a user opens the home page and conducts a voice session
+- **THEN** the home page header and assistant transcript badge render the configured assistant name instead of a hardcoded default
+
+#### Scenario: Unaddressed background chatter omitted from live captions
+- **WHEN** background speakers talk during an active voice session without addressing a configured wake name or alias while no wake window is armed
+- **THEN** the home page does not append the discarded background utterance to the live transcript list
+
 ### Requirement: Real-time transcript and grounded citation drawer
 The system SHALL display streaming user and assistant captions and tool-execution indicators synchronized with spoken output, SHALL display interactive non-skill RAG citation badges and excerpt previews only to authenticated administrators, and SHALL exclude Agent Skill (`SKILL.md`) definitions from home-page citation badges for every role during conversations.
 

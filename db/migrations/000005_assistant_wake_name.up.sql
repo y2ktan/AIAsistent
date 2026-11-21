@@ -1,0 +1,3 @@
+ALTER TABLE agent_configs
+ADD COLUMN IF NOT EXISTS assistant_name TEXT NOT NULL DEFAULT 'Aegis',
+ADD COLUMN IF NOT EXISTS wake_aliases TEXT[] NOT NULL DEFAULT '{}';

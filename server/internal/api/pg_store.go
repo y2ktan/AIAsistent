@@ -102,7 +102,8 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		       tts_base_url, tts_model, tts_voice,
 		       embedding_base_url, embedding_model, embedding_dim,
 		       system_instructions, api_key_ciphertext, api_key_last4,
-		       rag_top_k, rag_min_similarity, audio_focus_enabled, updated_at
+		       rag_top_k, rag_min_similarity, audio_focus_enabled,
+		       assistant_name, wake_aliases, updated_at
 		FROM agent_configs WHERE name = 'default'
 	`).Scan(
 		&r.ID, &r.Name, &r.Mode, &r.RealtimeWSURL, &r.RealtimeModel,
@@ -110,7 +111,8 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		&r.TTSBaseURL, &r.TTSModel, &r.TTSVoice,
 		&r.EmbeddingBaseURL, &r.EmbeddingModel, &r.EmbeddingDim,
 		&r.SystemInstructions, &r.APIKeyCiphertext, &r.APIKeyLast4,
-		&r.RAGTopK, &r.RAGMinSimilarity, &r.AudioFocusEnabled, &r.UpdatedAt,
+		&r.RAGTopK, &r.RAGMinSimilarity, &r.AudioFocusEnabled,
+		&r.AssistantName, &r.WakeAliases, &r.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &AgentConfigRecord{
@@ -125,12 +127,31 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 			RAGTopK:           5,
 			RAGMinSimilarity:  0.35,
 			AudioFocusEnabled: true,
+			AssistantName:     agent.DefaultAssistantName,
+			WakeAliases:       []string{},
 		}, nil
 	}
-	return r, err
+	if err != nil {
+		return nil, err
+	}
+	if r.AssistantName == "" {
+		r.AssistantName = agent.DefaultAssistantName
+	}
+	if r.WakeAliases == nil {
+		r.WakeAliases = []string{}
+	}
+	return r, nil
 }
 
 func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRecord) error {
+	assistantName := rec.AssistantName
+	if assistantName == "" {
+		assistantName = agent.DefaultAssistantName
+	}
+	wakeAliases := rec.WakeAliases
+	if wakeAliases == nil {
+		wakeAliases = []string{}
+	}
 	return s.pool.QueryRow(ctx, `
 		INSERT INTO agent_configs (
 			name, mode, realtime_ws_url, realtime_model,
@@ -138,9 +159,10 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			tts_base_url, tts_model, tts_voice,
 			embedding_base_url, embedding_model, embedding_dim,
 			system_instructions, api_key_ciphertext, api_key_last4,
-			rag_top_k, rag_min_similarity, audio_focus_enabled, updated_at
+			rag_top_k, rag_min_similarity, audio_focus_enabled,
+			assistant_name, wake_aliases, updated_at
 		) VALUES (
-			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW()
+			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, NOW()
 		)
 		ON CONFLICT (name) DO UPDATE SET
 			mode = EXCLUDED.mode,
@@ -162,6 +184,8 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			rag_top_k = EXCLUDED.rag_top_k,
 			rag_min_similarity = EXCLUDED.rag_min_similarity,
 			audio_focus_enabled = EXCLUDED.audio_focus_enabled,
+			assistant_name = EXCLUDED.assistant_name,
+			wake_aliases = EXCLUDED.wake_aliases,
 			updated_at = NOW()
 		RETURNING id::text, updated_at
 	`,
@@ -171,6 +195,7 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 		rec.EmbeddingBaseURL, rec.EmbeddingModel, rec.EmbeddingDim,
 		rec.SystemInstructions, rec.APIKeyCiphertext, rec.APIKeyLast4,
 		rec.RAGTopK, rec.RAGMinSimilarity, rec.AudioFocusEnabled,
+		assistantName, wakeAliases,
 	).Scan(&rec.ID, &rec.UpdatedAt)
 }
 

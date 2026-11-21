@@ -68,6 +68,13 @@ export function filterVisibleCitations(citations: CitationItem[]): CitationItem[
   return citations.filter((citation) => !isAgentSkillCitation(citation));
 }
 
+export const DEFAULT_ASSISTANT_NAME = "Aegis";
+
+export function normalizeAssistantName(name?: string | null): string {
+  const trimmed = typeof name === "string" ? name.trim() : "";
+  return trimmed || DEFAULT_ASSISTANT_NAME;
+}
+
 export function parseRTCEvent(raw: string): RTCEventPayload | null {
   try {
     const parsed = JSON.parse(raw) as RTCEventPayload;
@@ -82,6 +89,7 @@ export function useVoiceAgentRTC() {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [agentState, setAgentState] = useState<AgentState>("idle");
+  const [assistantName, setAssistantName] = useState(DEFAULT_ASSISTANT_NAME);
   const [micEnabled, setMicEnabled] = useState(true);
   const [speakerEnabled, setSpeakerEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(false);
@@ -247,9 +255,15 @@ export function useVoiceAgentRTC() {
     try {
       let audioFocusEnabled = true;
       try {
-        const sessionConfig = await apiFetch<{ audioFocusEnabled?: boolean }>("/api/v1/rtc/config");
+        const sessionConfig = await apiFetch<{
+          assistantName?: string;
+          audioFocusEnabled?: boolean;
+        }>("/api/v1/rtc/config");
         if (typeof sessionConfig.audioFocusEnabled === "boolean") {
           audioFocusEnabled = sessionConfig.audioFocusEnabled;
+        }
+        if (typeof sessionConfig.assistantName === "string") {
+          setAssistantName(normalizeAssistantName(sessionConfig.assistantName));
         }
       } catch {
         audioFocusEnabled = true;
@@ -512,6 +526,20 @@ export function useVoiceAgentRTC() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    apiFetch<{ assistantName?: string; audioFocusEnabled?: boolean }>("/api/v1/rtc/config")
+      .then((cfg) => {
+        if (active && cfg && typeof cfg.assistantName === "string") {
+          setAssistantName(normalizeAssistantName(cfg.assistantName));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       stopCall();
     };
@@ -521,6 +549,7 @@ export function useVoiceAgentRTC() {
     connected,
     connecting,
     agentState,
+    assistantName,
     micEnabled,
     speakerEnabled,
     cameraEnabled,

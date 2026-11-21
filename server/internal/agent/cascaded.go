@@ -24,9 +24,13 @@ type CascadedAdapter struct {
 	deps              Dependencies
 	httpClient        *http.Client
 	mu                sync.Mutex
+	turnSeq           uint64
+	activeTurnID      uint64
 	turnCancel        context.CancelFunc
 	speaking          bool
 	disableVerboseSTT bool
+	disablePromptSTT  bool
+	wakeGate          *WakeTurnGate
 	langState         *LanguageSessionState
 	lastDetectedLang  string
 	lastReplyLang     string
@@ -38,6 +42,7 @@ func NewCascadedAdapter(deps Dependencies) *CascadedAdapter {
 		deps: deps,
 		// Generous timeout: self-hosted CPU models can take well over a minute on cold start.
 		httpClient: security.NewSafeHTTPClient(deps.Config.AllowPrivate, 180*time.Second),
+		wakeGate:   NewWakeTurnGate(DefaultWakeWindow),
 		langState:  NewLanguageSessionState(),
 	}
 }
@@ -68,6 +73,7 @@ func (c *CascadedAdapter) BargeIn() {
 	c.mu.Lock()
 	cancel := c.turnCancel
 	c.turnCancel = nil
+	c.activeTurnID = 0
 	c.speaking = false
 	c.mu.Unlock()
 
@@ -75,6 +81,12 @@ func (c *CascadedAdapter) BargeIn() {
 		cancel()
 	}
 	c.deps.Sink.SendEvent(rtc.NewBargeInEvent())
+}
+
+func (c *CascadedAdapter) hasActiveTurn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.turnCancel != nil || c.speaking
 }
 
 // IsSpeaking reports whether assistant audio is currently being streamed to the peer.
@@ -91,41 +103,92 @@ func (c *CascadedAdapter) setSpeaking(v bool) {
 }
 
 func (c *CascadedAdapter) Close() error {
+	if c.wakeGate != nil {
+		c.wakeGate.Close()
+	}
 	c.BargeIn()
 	return nil
 }
 
 func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) error {
-	c.BargeIn()
-
-	turnCtx, cancel := context.WithCancel(ctx)
-	c.mu.Lock()
-	c.turnCancel = cancel
-	c.mu.Unlock()
-	defer cancel()
-
 	cfg := c.deps.Config
-	c.deps.Sink.SendEvent(rtc.NewStateEvent("thinking"))
 
-	// 1. Speech-to-Text
-	userText, sttLang, err := c.transcribe(turnCtx, audioData)
+	// 1. Non-destructive Speech-to-Text BEFORE cancelling any active turn or emitting thinking state.
+	userText, sttLang, err := c.transcribe(ctx, audioData)
 	if err != nil {
-		// A barge-in cancels the in-flight turn; that is not a user-facing failure.
-		if turnCtx.Err() != nil {
-			return turnCtx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		c.deps.Sink.SendEvent(rtc.NewErrorEvent("Speech transcription failed."))
-		c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		if !c.hasActiveTurn() {
+			c.deps.Sink.SendEvent(rtc.NewErrorEvent("Speech transcription failed."))
+			c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		}
 		return err
 	}
 	if strings.TrimSpace(userText) == "" {
-		c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		if !c.hasActiveTurn() {
+			c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		}
 		return nil
 	}
+
+	// 2. Wake-name prefix & pause-accumulation gate.
+	c.mu.Lock()
+	if c.wakeGate == nil {
+		c.wakeGate = NewWakeTurnGate(DefaultWakeWindow)
+	}
+	gate := c.wakeGate
+	c.mu.Unlock()
+
+	gateRes := gate.Evaluate(userText, cfg.AssistantName, cfg.WakeAliases)
+	switch gateRes.Action {
+	case WakeActionIgnore:
+		// Unaddressed background speech: do not interrupt in-flight turns or emit user captions.
+		return nil
+	case WakeActionBufferWait:
+		// User addressed the wake name (or continued within the 15s armed window) without asking a question yet.
+		if gateRes.WakeMatched && c.hasActiveTurn() {
+			c.BargeIn()
+		}
+		c.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "user", userText))
+		if !c.hasActiveTurn() {
+			c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		}
+		return nil
+	}
+
+	// WakeActionRespond: wake-authorized direct question. Interrupt any active assistant speech/turn now.
+	if c.hasActiveTurn() {
+		c.BargeIn()
+	}
+
+	turnCtx, cancel := context.WithCancel(ctx)
+	c.mu.Lock()
+	c.turnSeq++
+	myTurnID := c.turnSeq
+	c.activeTurnID = myTurnID
+	c.turnCancel = cancel
+	c.mu.Unlock()
+	defer func() {
+		cancel()
+		c.mu.Lock()
+		if c.activeTurnID == myTurnID {
+			c.turnCancel = nil
+			c.activeTurnID = 0
+		}
+		c.mu.Unlock()
+	}()
+
 	c.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "user", userText))
+	c.deps.Sink.SendEvent(rtc.NewStateEvent("thinking"))
+
+	queryText := gateRes.CombinedText
+	if strings.TrimSpace(queryText) == "" {
+		queryText = userText
+	}
 
 	vl := c.voiceLanguages()
-	detectedCode, detectedName := DetectUtteranceLanguage(sttLang, userText, vl)
+	detectedCode, detectedName := DetectUtteranceLanguage(sttLang, queryText, vl)
 	c.mu.Lock()
 	if c.langState == nil {
 		c.langState = NewLanguageSessionState()
@@ -140,11 +203,11 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 	c.mu.Unlock()
 	langInstruction := BuildLanguageSystemInstruction(langRes)
 
-	// 2. RAG Retrieval
+	// 3. RAG Retrieval
 	var ragContext string
 	if c.deps.RAGService != nil && c.deps.Embedder != nil {
 		c.deps.Sink.SendEvent(rtc.NewStateEvent("retrieving"))
-		hits, err := c.deps.RAGService.Retrieve(turnCtx, userText, cfg.RAGTopK, cfg.RAGMinSimilarity, c.deps.Embedder)
+		hits, err := c.deps.RAGService.Retrieve(turnCtx, queryText, cfg.RAGTopK, cfg.RAGMinSimilarity, c.deps.Embedder)
 		if err == nil && len(hits) > 0 {
 			c.deps.Sink.SendEvent(rtc.Event{
 				Type:      "citation",
@@ -155,14 +218,14 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		}
 	}
 
-	// 3. Vision frame + LLM Chat Completions with MCP tool loop
+	// 4. Vision frame + LLM Chat Completions with MCP tool loop
 	c.deps.Sink.SendEvent(rtc.NewStateEvent("thinking"))
 	var videoFrame []byte
 	if frame, ok := c.deps.Sink.LatestVideoFrame(); ok {
 		videoFrame = frame
 	}
 
-	reply, err := c.chatWithTools(turnCtx, userText, ragContext, videoFrame, langInstruction)
+	reply, err := c.chatWithTools(turnCtx, queryText, ragContext, videoFrame, langInstruction)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || turnCtx.Err() != nil {
 			return err
@@ -170,6 +233,14 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		c.deps.Sink.SendEvent(rtc.NewErrorEvent("Assistant failed to generate a response."))
 		c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
 		return err
+	}
+
+	if IsWaitForQuestionReply(reply) {
+		gate.RestoreBuffered(gateRes.Segments)
+		if turnCtx.Err() == nil {
+			c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
+		}
+		return nil
 	}
 
 	reply = SanitizeAssistantOutput(reply, []string{cfg.APIKey})
@@ -181,7 +252,7 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 	c.lastReplyLang = actualCode
 	c.mu.Unlock()
 
-	// 4. Streaming TTS
+	// 5. Streaming TTS
 	if cfg.TTSBaseURL != "" && reply != "" {
 		c.deps.Sink.SendEvent(rtc.NewStateEvent("speaking"))
 		c.setSpeaking(true)
@@ -208,11 +279,14 @@ func (c *CascadedAdapter) transcribe(ctx context.Context, audioData []byte) (str
 		return "", "", err
 	}
 
+	wakePrompt := BuildWakeVocabularyPrompt(c.deps.Config.AssistantName, c.deps.Config.WakeAliases)
+
 	c.mu.Lock()
 	useVerbose := !c.disableVerboseSTT
+	usePrompt := !c.disablePromptSTT && wakePrompt != ""
 	c.mu.Unlock()
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		var buf bytes.Buffer
 		mw := multipart.NewWriter(&buf)
 		model := c.deps.Config.STTModel
@@ -222,6 +296,9 @@ func (c *CascadedAdapter) transcribe(ctx context.Context, audioData []byte) (str
 		_ = mw.WriteField("model", model)
 		if useVerbose {
 			_ = mw.WriteField("response_format", "verbose_json")
+		}
+		if usePrompt {
+			_ = mw.WriteField("prompt", wakePrompt)
 		}
 		filename := "audio.wav"
 		if bytes.HasPrefix(audioData, []byte("OggS")) {
@@ -247,13 +324,31 @@ func (c *CascadedAdapter) transcribe(ctx context.Context, audioData []byte) (str
 		if err != nil {
 			return "", "", err
 		}
-		if resp.StatusCode == http.StatusBadRequest && useVerbose {
+		if resp.StatusCode == http.StatusBadRequest && (useVerbose || usePrompt) {
+			errBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
-			c.mu.Lock()
-			c.disableVerboseSTT = true
-			c.mu.Unlock()
-			useVerbose = false
-			continue
+			errLower := strings.ToLower(string(errBytes))
+			if usePrompt && strings.Contains(errLower, "prompt") && !strings.Contains(errLower, "response_format") {
+				c.mu.Lock()
+				c.disablePromptSTT = true
+				c.mu.Unlock()
+				usePrompt = false
+				continue
+			}
+			if useVerbose {
+				c.mu.Lock()
+				c.disableVerboseSTT = true
+				c.mu.Unlock()
+				useVerbose = false
+				continue
+			}
+			if usePrompt {
+				c.mu.Lock()
+				c.disablePromptSTT = true
+				c.mu.Unlock()
+				usePrompt = false
+				continue
+			}
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			_ = resp.Body.Close()
@@ -281,7 +376,7 @@ func (c *CascadedAdapter) chatWithTools(ctx context.Context, userText, ragContex
 	}
 
 	messages := []map[string]any{
-		{"role": "system", "content": BuildSystemPromptWithSkills(c.deps.Config.SystemInstructions, c.deps.Skills)},
+		{"role": "system", "content": BuildSystemPromptWithSkills(c.deps.Config.SystemInstructions, c.deps.Config.AssistantName, c.deps.Skills)},
 	}
 	if langInstruction != "" {
 		messages = append(messages, map[string]any{

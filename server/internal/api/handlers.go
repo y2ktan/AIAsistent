@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"aegis-voice/server/internal/agent"
 	"aegis-voice/server/internal/auth"
@@ -386,12 +387,55 @@ func (s *Server) HandleDeleteAgentSkill(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+func normalizeAgentConfigDefaults(cfg *AgentConfigRecord) {
+	if cfg == nil {
+		return
+	}
+	cfg.AssistantName = strings.TrimSpace(cfg.AssistantName)
+	if cfg.AssistantName == "" {
+		cfg.AssistantName = agent.DefaultAssistantName
+	}
+	if cfg.WakeAliases == nil {
+		cfg.WakeAliases = []string{}
+	}
+}
+
+func normalizeWakeAliases(primaryName string, rawAliases []string) ([]string, error) {
+	seen := map[string]struct{}{
+		agent.CanonicalWakeKey(primaryName): {},
+	}
+	cleaned := make([]string, 0, len(rawAliases))
+	for _, raw := range rawAliases {
+		alias := strings.TrimSpace(raw)
+		if alias == "" {
+			continue
+		}
+		if utf8.RuneCountInString(alias) > 64 {
+			return nil, errors.New("each wake alias must be 64 characters or fewer")
+		}
+		key := agent.CanonicalWakeKey(alias)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		cleaned = append(cleaned, alias)
+		if len(cleaned) > 16 {
+			return nil, errors.New("maximum of 16 wake aliases allowed")
+		}
+	}
+	return cleaned, nil
+}
+
 func (s *Server) HandleGetAgentConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, err := s.adminStore.GetAgentConfig(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
 		return
 	}
+	normalizeAgentConfigDefaults(cfg)
 	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
 }
 
@@ -588,9 +632,11 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		EmbeddingDim       int     `json:"embeddingDim"`
 		SystemInstructions string  `json:"systemInstructions"`
 		APIKey             string  `json:"apiKey"`
-		RAGTopK            int     `json:"ragTopK"`
-		RAGMinSimilarity   float64 `json:"ragMinSimilarity"`
-		AudioFocusEnabled  *bool   `json:"audioFocusEnabled"`
+		RAGTopK            int       `json:"ragTopK"`
+		RAGMinSimilarity   float64   `json:"ragMinSimilarity"`
+		AudioFocusEnabled  *bool     `json:"audioFocusEnabled"`
+		AssistantName      *string   `json:"assistantName"`
+		WakeAliases        *[]string `json:"wakeAliases"`
 	}
 	if err := decodeStrictJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -648,12 +694,46 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	rec.AudioFocusEnabled = true
+	rec.AssistantName = agent.DefaultAssistantName
+	rec.WakeAliases = []string{}
 	if existing != nil {
 		rec.AudioFocusEnabled = existing.AudioFocusEnabled
+		if trimmedExisting := strings.TrimSpace(existing.AssistantName); trimmedExisting != "" {
+			rec.AssistantName = trimmedExisting
+		}
+		if len(existing.WakeAliases) > 0 {
+			rec.WakeAliases = append([]string{}, existing.WakeAliases...)
+		}
 	}
 	if req.AudioFocusEnabled != nil {
 		rec.AudioFocusEnabled = *req.AudioFocusEnabled
 	}
+	if req.AssistantName != nil {
+		trimmedName := strings.TrimSpace(*req.AssistantName)
+		if trimmedName == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "assistantName must not be empty"})
+			return
+		}
+		if utf8.RuneCountInString(trimmedName) > 64 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "assistantName must be 64 characters or fewer"})
+			return
+		}
+		rec.AssistantName = trimmedName
+	}
+	aliasSource := rec.WakeAliases
+	if req.WakeAliases != nil {
+		if len(*req.WakeAliases) > 32 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "maximum of 16 wake aliases allowed"})
+			return
+		}
+		aliasSource = *req.WakeAliases
+	}
+	normalizedAliases, err := normalizeWakeAliases(rec.AssistantName, aliasSource)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	rec.WakeAliases = normalizedAliases
 
 	if strings.TrimSpace(req.APIKey) != "" {
 		ct, err := s.vault.Encrypt(req.APIKey)
@@ -672,6 +752,8 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 	s.audit(r.Context(), r, "admin.agent_config.update", "agent_config", rec.ID, "success", map[string]any{
 		"mode":              rec.Mode,
 		"audioFocusEnabled": rec.AudioFocusEnabled,
+		"assistantName":     rec.AssistantName,
+		"wakeAliases":       rec.WakeAliases,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"config": rec})
 }
@@ -939,7 +1021,11 @@ func (s *Server) HandleRTCConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load voice session config"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"audioFocusEnabled": cfg.AudioFocusEnabled})
+	normalizeAgentConfigDefaults(cfg)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"audioFocusEnabled": cfg.AudioFocusEnabled,
+		"assistantName":     cfg.AssistantName,
+	})
 }
 
 func (s *Server) HandleRTCOffer(w http.ResponseWriter, r *http.Request) {
@@ -1039,6 +1125,7 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 		})
 	}
 
+	normalizeAgentConfigDefaults(cfgRec)
 	vl, _, _ := s.effectiveVoiceLanguages(ctx)
 	emb, _ := s.activeEmbedder(ctx)
 	deps := agent.Dependencies{
@@ -1060,6 +1147,8 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 			RAGTopK:            cfgRec.RAGTopK,
 			RAGMinSimilarity:   cfgRec.RAGMinSimilarity,
 			AudioFocusEnabled:  cfgRec.AudioFocusEnabled,
+			AssistantName:      cfgRec.AssistantName,
+			WakeAliases:        append([]string{}, cfgRec.WakeAliases...),
 			AllowPrivate:       s.allowPrivate,
 			VoiceLanguages:     vl,
 		},
@@ -1098,11 +1187,6 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 		bufMu.Lock()
 		speaking = true
 		bufMu.Unlock()
-		// Only interrupt when the assistant is audibly speaking; speech (or noise)
-		// while it is thinking must not cancel the in-flight LLM request.
-		if cascaded.IsSpeaking() {
-			cascaded.BargeIn()
-		}
 	}
 
 	ps.OnSpeechEnd = func() {

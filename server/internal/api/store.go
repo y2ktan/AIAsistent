@@ -38,6 +38,8 @@ type AgentConfigRecord struct {
 	RAGTopK            int       `json:"ragTopK"`
 	RAGMinSimilarity   float64   `json:"ragMinSimilarity"`
 	AudioFocusEnabled  bool      `json:"audioFocusEnabled"`
+	AssistantName      string    `json:"assistantName"`
+	WakeAliases        []string  `json:"wakeAliases"`
 	UpdatedAt          time.Time `json:"updatedAt"`
 }
 

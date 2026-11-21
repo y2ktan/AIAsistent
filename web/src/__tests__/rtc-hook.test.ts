@@ -6,10 +6,16 @@ const rtcState = vi.hoisted(() => ({
   connected: true,
   connecting: false,
   agentState: "thinking" as const,
+  assistantName: "Aegis",
   micEnabled: true,
   speakerEnabled: true,
   cameraEnabled: false,
-  transcripts: [],
+  transcripts: [] as Array<{
+    id: string;
+    role: "user" | "assistant";
+    text: string;
+    isPartial?: boolean;
+  }>,
   citations: [] as Array<{
     documentId: string;
     documentTitle: string;
@@ -62,9 +68,11 @@ vi.mock("@/hooks/useVoiceAgentRTC", async (importOriginal) => {
 });
 
 import HomePage from "@/app/page";
+import { apiFetch } from "@/lib/api-client";
 import {
   filterVisibleCitations,
   isAgentSkillCitation,
+  normalizeAssistantName,
   parseRTCEvent,
 } from "@/hooks/useVoiceAgentRTC";
 import { buildMicrophoneConstraints } from "@/lib/audio-focus";
@@ -162,6 +170,8 @@ describe("home-page citation rendering", () => {
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     session.role = "user";
+    rtcState.assistantName = "Aegis";
+    rtcState.transcripts = [];
     rtcState.citations = [
       {
         documentId: "skill-1",
@@ -227,5 +237,59 @@ describe("home-page citation rendering", () => {
     });
 
     expect(container.textContent).toContain("The supported workflow is documented here.");
+  });
+
+  it("renders configured English or Chinese assistantName in header and assistant transcript labels", async () => {
+    expect(normalizeAssistantName(undefined)).toBe("Aegis");
+    expect(normalizeAssistantName("   ")).toBe("Aegis");
+    expect(normalizeAssistantName("  小智  ")).toBe("小智");
+
+    rtcState.assistantName = "小智";
+    rtcState.transcripts = [
+      { id: "t1", role: "user", text: "小智，现在几点？" },
+      { id: "t2", role: "assistant", text: "现在是下午三点。" },
+    ];
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(createElement(HomePage));
+    });
+
+    const headerName = container.querySelector('[data-testid="assistant-header-name"]');
+    expect(headerName?.textContent).toBe("小智");
+
+    const speakerLabels = Array.from(
+      container.querySelectorAll('[data-testid="transcript-speaker-label"]')
+    ).map((el) => el.textContent);
+    expect(speakerLabels).toEqual(["You", "小智"]);
+    expect(container.textContent).not.toContain("Aegis");
+  });
+
+  it("loads assistantName from /api/v1/rtc/config inside useVoiceAgentRTC", async () => {
+    const actualHookModule = await vi.importActual<typeof import("@/hooks/useVoiceAgentRTC")>(
+      "@/hooks/useVoiceAgentRTC"
+    );
+    vi.mocked(apiFetch).mockImplementationOnce(async (path: string) => {
+      expect(path).toBe("/api/v1/rtc/config");
+      return { assistantName: "Jarvis", audioFocusEnabled: true };
+    });
+
+    function Probe() {
+      const { assistantName } = actualHookModule.useVoiceAgentRTC();
+      return createElement("div", { "data-testid": "probe-name" }, assistantName);
+    }
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(createElement(Probe));
+    });
+
+    expect(container.querySelector('[data-testid="probe-name"]')?.textContent).toBe("Jarvis");
   });
 });

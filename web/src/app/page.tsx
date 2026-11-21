@@ -21,7 +21,11 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
-import { filterVisibleCitations, useVoiceAgentRTC } from "@/hooks/useVoiceAgentRTC";
+import {
+  filterVisibleCitations,
+  normalizeAssistantName,
+  useVoiceAgentRTC,
+} from "@/hooks/useVoiceAgentRTC";
 import { LiquidPlasmaOrb } from "@/components/LiquidPlasmaOrb";
 
 export default function HomePage() {
@@ -33,6 +37,7 @@ export default function HomePage() {
     connected,
     connecting,
     agentState,
+    assistantName,
     micEnabled,
     speakerEnabled,
     cameraEnabled,
@@ -70,6 +75,7 @@ export default function HomePage() {
     }
   }
 
+  const displayAssistantName = normalizeAssistantName(assistantName);
   const latestTranscripts = transcripts.slice(-3);
   const visibleCitations = filterVisibleCitations(citations);
 
@@ -81,8 +87,11 @@ export default function HomePage() {
       <header className="relative z-10 flex items-center justify-between px-6 py-4">
         <div className="flex items-center gap-3">
           <div className="h-2.5 w-2.5 rounded-full bg-cyan-400 shadow-sm shadow-cyan-400" />
-          <span className="text-sm font-semibold tracking-wide text-white">
-            Aegis Voice
+          <span
+            data-testid="assistant-header-name"
+            className="text-sm font-semibold tracking-wide text-white"
+          >
+            {displayAssistantName}
           </span>
           <span className="rounded-full border border-slate-700/60 bg-slate-900/60 px-2.5 py-0.5 text-[11px] uppercase tracking-wider text-slate-300 backdrop-blur-md">
             {agentState}
@@ -142,8 +151,11 @@ export default function HomePage() {
                     : "mr-auto max-w-xl border-cyan-500/25 bg-slate-900/75 text-white"
                 }`}
               >
-                <span className="mr-2 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                  {t.role === "user" ? "You" : "Aegis"}
+                <span
+                  data-testid="transcript-speaker-label"
+                  className="mr-2 text-[10px] font-semibold uppercase tracking-wider text-slate-400"
+                >
+                  {t.role === "user" ? "You" : displayAssistantName}
                 </span>
                 <span>{t.text}</span>
               </div>

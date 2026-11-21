@@ -44,7 +44,7 @@ Run the web suite with `npm test` inside `web/`. Both pass before this change (7
 - [x] 6.1 Create `web/src/lib/voice-languages.ts` with the types and pure helpers the page needs: add a language, remove a language, whether a row may be removed, and which catalog languages are still available to add. Verify with new vitest tests covering add, remove, the default row not being removable, and an already-listed language not being offered.
 - [x] 6.2 Add a "Voice languages" card to the AI Agent tab in `web/src/app/admin/page.tsx`, outside the existing configuration form, with its own Save button: one row per language (name, voice input, default selector, remove button disabled on the default row with an explanation), a hint on rows with no voice that replies will be in the default language, and an add-language selector. Show the server's message when a save is rejected. Verify that `npm test` passes and the web image builds.
 - [x] 6.3 Add a "Voice languages" section to `README.md` covering where the setting is, the default-language rules, the fallback behaviour, and that Cantonese and Malay need a speech engine that has voices for them. Verify the section matches the behaviour in the spec.
-- [ ] 6.4 Check in the browser with the stack running: on `/admin`, add Japanese and save, reload and see it listed; remove it and save; confirm the default row cannot be removed; clear the default's voice, save, and see the rejection message.
+- [x] 6.4 Check in the browser with the stack running: on `/admin`, add Japanese and save, reload and see it listed; remove it and save; confirm the default row cannot be removed; clear the default's voice, save, and see the rejection message.
 
 ## 7. Local stack and end to end
 
