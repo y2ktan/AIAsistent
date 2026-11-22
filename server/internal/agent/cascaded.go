@@ -270,6 +270,7 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		c.setSpeaking(false)
 		if err != nil && !errors.Is(err, context.Canceled) && turnCtx.Err() == nil {
 			c.deps.Sink.SendEvent(rtc.NewErrorEvent("Speech synthesis failed."))
+			return err
 		}
 	}
 
@@ -737,30 +738,102 @@ func (c *CascadedAdapter) synthesizeElevenLabs(ctx context.Context, text, voice,
 	if model == "" {
 		model = "eleven_flash_v2_5"
 	}
-	payload, err := json.Marshal(map[string]any{
-		"text":          text,
-		"model_id":      model,
-		"language_code": languageCode,
-	})
-	if err != nil {
-		return err
+	voices := []string{voice}
+	for _, fallbackVoice := range c.elevenLabsFallbackVoices(languageCode, voice) {
+		voices = appendUniqueString(voices, fallbackVoice)
 	}
-	endpoint := strings.TrimRight(elevenLabsAPIBaseURL, "/") + "/v1/text-to-speech/" + url.PathEscape(voice) + "/stream?output_format=opus_48000_64"
+
+	var lastStatus int
+	for _, candidateVoice := range voices {
+		resp, err := c.requestElevenLabsTTS(ctx, text, candidateVoice, model, languageCode)
+		if err != nil {
+			return err
+		}
+		lastStatus = resp.StatusCode
+		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) &&
+			strings.TrimSpace(languageCode) != "" {
+			_ = resp.Body.Close()
+			resp, err = c.requestElevenLabsTTS(ctx, text, candidateVoice, model, "")
+			if err != nil {
+				return err
+			}
+			lastStatus = resp.StatusCode
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			defer func() { _ = resp.Body.Close() }()
+			return c.streamOggOpus(ctx, bufio.NewReader(resp.Body))
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusPaymentRequired &&
+			resp.StatusCode != http.StatusForbidden &&
+			resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("elevenlabs tts status %d", resp.StatusCode)
+		}
+	}
+	return fmt.Errorf("elevenlabs tts status %d", lastStatus)
+}
+
+func (c *CascadedAdapter) elevenLabsFallbackVoices(languageCode, failedVoice string) []string {
+	settings := c.deps.Config.VoiceLanguages
+	var fallbacks []string
+	if normalized := strings.ToLower(strings.TrimSpace(languageCode)); normalized != "" {
+		for _, lang := range settings.Languages {
+			if strings.EqualFold(strings.TrimSpace(lang.Code), normalized) {
+				continue
+			}
+			voice := strings.TrimSpace(lang.ElevenLabsVoice)
+			if voice != "" {
+				fallbacks = appendUniqueString(fallbacks, voice)
+			}
+		}
+	}
+	for _, lang := range settings.Languages {
+		voice := strings.TrimSpace(lang.ElevenLabsVoice)
+		if voice != "" && voice != strings.TrimSpace(failedVoice) {
+			fallbacks = appendUniqueString(fallbacks, voice)
+		}
+	}
+	return fallbacks
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func (c *CascadedAdapter) requestElevenLabsTTS(
+	ctx context.Context,
+	text, voice, model, languageCode string,
+) (*http.Response, error) {
+	payloadFields := map[string]any{
+		"text":     text,
+		"model_id": model,
+	}
+	if strings.TrimSpace(languageCode) != "" {
+		payloadFields["language_code"] = languageCode
+	}
+	payload, err := json.Marshal(payloadFields)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := strings.TrimRight(elevenLabsAPIBaseURL, "/") +
+		"/v1/text-to-speech/" + url.PathEscape(voice) +
+		"/stream?output_format=opus_48000_64"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("xi-api-key", c.deps.Config.ElevenLabsAPIKey)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("elevenlabs tts status %d", resp.StatusCode)
-	}
-	return c.streamOggOpus(ctx, bufio.NewReader(resp.Body))
+	return c.httpClient.Do(req)
 }
 
 func (c *CascadedAdapter) streamOggOpus(ctx context.Context, br *bufio.Reader) error {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -217,6 +218,7 @@ func TestElevenLabsSpeechRequests(t *testing.T) {
 		if got := r.Header.Get("xi-api-key"); got != "eleven-test-key" {
 			t.Errorf("xi-api-key = %q", got)
 		}
+
 		switch r.URL.Path {
 		case "/v1/speech-to-text":
 			if err := r.ParseMultipartForm(1 << 20); err != nil {
@@ -274,6 +276,97 @@ func TestElevenLabsSpeechRequests(t *testing.T) {
 	}
 	if len(sink.audio) != 1 {
 		t.Fatalf("audio samples = %d, want 1", len(sink.audio))
+	}
+}
+
+func TestElevenLabsTTSRetriesWithoutLanguageCode(t *testing.T) {
+	requests := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := payload["language_code"]; ok {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+
+		var stream bytes.Buffer
+		const serial = 0x12345679
+		writeOggPage(&stream, 0x02, 0, serial, 0, []byte("OpusHead\x01\x01\x38\x01\x80\xbb\x00\x00\x00\x00\x00"))
+		writeOggPage(&stream, 0x00, 0, serial, 1, []byte("OpusTags\x04\x00\x00\x00test\x00\x00\x00\x00"))
+		stream.Write(buildTestOggPage(0x04, 480, serial, 2, []byte{4}, []byte{27 << 3, 1, 2, 3}))
+		_, _ = w.Write(stream.Bytes())
+	}))
+	defer provider.Close()
+
+	oldBase := elevenLabsAPIBaseURL
+	elevenLabsAPIBaseURL = provider.URL
+	t.Cleanup(func() { elevenLabsAPIBaseURL = oldBase })
+
+	adapter := NewCascadedAdapter(Dependencies{
+		Config: AgentConfig{
+			SpeechProvider:     "elevenlabs",
+			ElevenLabsAPIKey:   "eleven-test-key",
+			ElevenLabsTTSModel: "eleven_flash_v2_5",
+			AllowPrivate:       true,
+		},
+		Sink: &mockSink{},
+	})
+	if err := adapter.synthesizeElevenLabs(context.Background(), "你好", "voice-zh", "zh"); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
+func TestElevenLabsTTSFallsBackFromUnavailableVoice(t *testing.T) {
+	requestedVoices := []string{}
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		voice := strings.TrimPrefix(r.URL.Path, "/v1/text-to-speech/")
+		voice = strings.TrimSuffix(voice, "/stream")
+		requestedVoices = append(requestedVoices, voice)
+		if voice == "blocked-zh" {
+			w.WriteHeader(http.StatusPaymentRequired)
+			return
+		}
+
+		var stream bytes.Buffer
+		const serial = 0x12345680
+		writeOggPage(&stream, 0x02, 0, serial, 0, []byte("OpusHead\x01\x01\x38\x01\x80\xbb\x00\x00\x00\x00\x00"))
+		writeOggPage(&stream, 0x00, 0, serial, 1, []byte("OpusTags\x04\x00\x00\x00test\x00\x00\x00\x00"))
+		stream.Write(buildTestOggPage(0x04, 480, serial, 2, []byte{4}, []byte{27 << 3, 1, 2, 3}))
+		_, _ = w.Write(stream.Bytes())
+	}))
+	defer provider.Close()
+
+	oldBase := elevenLabsAPIBaseURL
+	elevenLabsAPIBaseURL = provider.URL
+	t.Cleanup(func() { elevenLabsAPIBaseURL = oldBase })
+
+	adapter := NewCascadedAdapter(Dependencies{
+		Config: AgentConfig{
+			SpeechProvider:     "elevenlabs",
+			ElevenLabsAPIKey:   "eleven-test-key",
+			ElevenLabsTTSModel: "eleven_flash_v2_5",
+			AllowPrivate:       true,
+			VoiceLanguages: VoiceLanguageSettings{
+				DefaultCode: "zh",
+				Languages: []VoiceLanguage{
+					{Code: "en", Name: "English", ElevenLabsVoice: "available-en"},
+					{Code: "zh", Name: "Mandarin Chinese", ElevenLabsVoice: "blocked-zh"},
+				},
+			},
+		},
+		Sink: &mockSink{},
+	})
+	if err := adapter.synthesizeElevenLabs(context.Background(), "你好", "blocked-zh", "zh"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(requestedVoices, []string{"blocked-zh", "available-en"}) {
+		t.Fatalf("requested voices = %#v", requestedVoices)
 	}
 }
 
