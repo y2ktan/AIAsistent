@@ -112,7 +112,7 @@ On the web client, a `barge_in` event no longer pauses the audio element. The se
 
 - [The model ignores the language instruction or leaves out the notice] → The script guard keeps the voice matched to the text. The notice is still marked as given. The proposal already notes that a stronger model than the one tested is likely needed. Task 7.2 checks behaviour with the real model.
 - [A third cause of silence exists beyond the two identified] → Task 1.5 checks by ear and names the exact browser statistics to read if speech is still silent.
-- [Speech-to-text cannot label Cantonese] → From model knowledge, not measured here: small Whisper models have no Cantonese label and report Mandarin. Cantonese would then be answered in Mandarin with no notice. Task 7.2 records what the configured model returns for Cantonese and Malay.
+- [Speech-to-text cannot label Cantonese] → Manual end-to-end checks passed for English, Mandarin, Cantonese, and Malay, including fallback and the once-only notice. The raw detected-language log fields were not retained after the test, so exact Cantonese and Malay labels remain unrecorded rather than inferred.
 - [Speech-to-text returns no language at all] → Latin-script languages cannot be told apart from text alone, so the assistant stays in the previous or default language. Han-script text is still recognised as Chinese.
 - [Two languages in the same script are mixed] → English with Malay, or Mandarin with Cantonese, follow the speech-to-text label alone and may not match "most of the utterance".
 - [A voice name is mistyped] → Voice names are free text, as the single voice is today. A wrong name fails at speaking time with the existing "Speech synthesis failed" message.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -103,7 +104,9 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		       embedding_base_url, embedding_model, embedding_dim,
 		       system_instructions, api_key_ciphertext, api_key_last4,
 		       rag_top_k, rag_min_similarity, audio_focus_enabled,
-		       assistant_name, wake_aliases, updated_at
+		       assistant_name, wake_aliases, speech_provider,
+		       elevenlabs_stt_model, elevenlabs_tts_model,
+		       elevenlabs_api_key_ciphertext, elevenlabs_api_key_last5, updated_at
 		FROM agent_configs WHERE name = 'default'
 	`).Scan(
 		&r.ID, &r.Name, &r.Mode, &r.RealtimeWSURL, &r.RealtimeModel,
@@ -112,23 +115,28 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		&r.EmbeddingBaseURL, &r.EmbeddingModel, &r.EmbeddingDim,
 		&r.SystemInstructions, &r.APIKeyCiphertext, &r.APIKeyLast4,
 		&r.RAGTopK, &r.RAGMinSimilarity, &r.AudioFocusEnabled,
-		&r.AssistantName, &r.WakeAliases, &r.UpdatedAt,
+		&r.AssistantName, &r.WakeAliases, &r.SpeechProvider,
+		&r.ElevenLabsSTTModel, &r.ElevenLabsTTSModel,
+		&r.ElevenLabsAPIKeyCiphertext, &r.ElevenLabsAPIKeyLast5, &r.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &AgentConfigRecord{
-			Name:              "default",
-			Mode:              "cascaded",
-			STTModel:          "whisper-1",
-			LLMModel:          "gpt-4o",
-			TTSModel:          "tts-1",
-			TTSVoice:          "alloy",
-			EmbeddingModel:    "text-embedding-3-small",
-			EmbeddingDim:      1536,
-			RAGTopK:           5,
-			RAGMinSimilarity:  0.35,
-			AudioFocusEnabled: true,
-			AssistantName:     agent.DefaultAssistantName,
-			WakeAliases:       []string{},
+			Name:               "default",
+			Mode:               "cascaded",
+			STTModel:           "whisper-1",
+			LLMModel:           "gpt-4o",
+			TTSModel:           "tts-1",
+			TTSVoice:           "alloy",
+			EmbeddingModel:     "text-embedding-3-small",
+			EmbeddingDim:       1536,
+			RAGTopK:            5,
+			RAGMinSimilarity:   0.35,
+			AudioFocusEnabled:  true,
+			AssistantName:      agent.DefaultAssistantName,
+			WakeAliases:        []string{},
+			SpeechProvider:     "local",
+			ElevenLabsSTTModel: "scribe_v3",
+			ElevenLabsTTSModel: "eleven_flash_v2_5",
 		}, nil
 	}
 	if err != nil {
@@ -152,7 +160,28 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 	if wakeAliases == nil {
 		wakeAliases = []string{}
 	}
-	return s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(734215)`); err != nil {
+		return err
+	}
+	provider := normalizeSpeechProvider(rec.SpeechProvider)
+	if provider == "elevenlabs" {
+		var voice string
+		if err := tx.QueryRow(ctx, `
+			SELECT elevenlabs_voice
+			FROM voice_languages
+			WHERE is_default = TRUE
+		`).Scan(&voice); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		} else if errors.Is(err, pgx.ErrNoRows) || strings.TrimSpace(voice) == "" {
+			return errors.New("the default language must have an ElevenLabs voice")
+		}
+	}
+	err = tx.QueryRow(ctx, `
 		INSERT INTO agent_configs (
 			name, mode, realtime_ws_url, realtime_model,
 			stt_base_url, stt_model, llm_base_url, llm_model,
@@ -160,9 +189,11 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			embedding_base_url, embedding_model, embedding_dim,
 			system_instructions, api_key_ciphertext, api_key_last4,
 			rag_top_k, rag_min_similarity, audio_focus_enabled,
-			assistant_name, wake_aliases, updated_at
+			assistant_name, wake_aliases, speech_provider,
+			elevenlabs_stt_model, elevenlabs_tts_model,
+			elevenlabs_api_key_ciphertext, elevenlabs_api_key_last5, updated_at
 		) VALUES (
-			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, NOW()
+			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, NOW()
 		)
 		ON CONFLICT (name) DO UPDATE SET
 			mode = EXCLUDED.mode,
@@ -186,6 +217,11 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			audio_focus_enabled = EXCLUDED.audio_focus_enabled,
 			assistant_name = EXCLUDED.assistant_name,
 			wake_aliases = EXCLUDED.wake_aliases,
+			speech_provider = EXCLUDED.speech_provider,
+			elevenlabs_stt_model = EXCLUDED.elevenlabs_stt_model,
+			elevenlabs_tts_model = EXCLUDED.elevenlabs_tts_model,
+			elevenlabs_api_key_ciphertext = COALESCE(EXCLUDED.elevenlabs_api_key_ciphertext, agent_configs.elevenlabs_api_key_ciphertext),
+			elevenlabs_api_key_last5 = CASE WHEN EXCLUDED.elevenlabs_api_key_last5 <> '' THEN EXCLUDED.elevenlabs_api_key_last5 ELSE agent_configs.elevenlabs_api_key_last5 END,
 			updated_at = NOW()
 		RETURNING id::text, updated_at
 	`,
@@ -195,8 +231,35 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 		rec.EmbeddingBaseURL, rec.EmbeddingModel, rec.EmbeddingDim,
 		rec.SystemInstructions, rec.APIKeyCiphertext, rec.APIKeyLast4,
 		rec.RAGTopK, rec.RAGMinSimilarity, rec.AudioFocusEnabled,
-		assistantName, wakeAliases,
+		assistantName, wakeAliases, provider,
+		normalizeElevenLabsSTTModel(rec.ElevenLabsSTTModel), normalizeElevenLabsTTSModel(rec.ElevenLabsTTSModel),
+		rec.ElevenLabsAPIKeyCiphertext, rec.ElevenLabsAPIKeyLast5,
 	).Scan(&rec.ID, &rec.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func normalizeSpeechProvider(provider string) string {
+	if provider == "elevenlabs" {
+		return provider
+	}
+	return "local"
+}
+
+func normalizeElevenLabsSTTModel(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return "scribe_v3"
+	}
+	return model
+}
+
+func normalizeElevenLabsTTSModel(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return "eleven_flash_v2_5"
+	}
+	return model
 }
 
 func (s *PGAdminStore) ListMCPServers(ctx context.Context) ([]MCPServerRecord, error) {
@@ -449,7 +512,7 @@ func (s *PGAdminStore) ListAuditLogs(ctx context.Context, limit, offset int) ([]
 
 func (s *PGAdminStore) GetVoiceLanguages(ctx context.Context) (agent.VoiceLanguageSettings, bool, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT code, name, voice, is_default
+		SELECT code, name, voice, elevenlabs_voice, is_default
 		FROM voice_languages
 		ORDER BY position ASC, code ASC
 	`)
@@ -462,7 +525,7 @@ func (s *PGAdminStore) GetVoiceLanguages(ctx context.Context) (agent.VoiceLangua
 	for rows.Next() {
 		var l agent.VoiceLanguage
 		var isDef bool
-		if err := rows.Scan(&l.Code, &l.Name, &l.Voice, &isDef); err != nil {
+		if err := rows.Scan(&l.Code, &l.Name, &l.Voice, &l.ElevenLabsVoice, &isDef); err != nil {
 			return agent.VoiceLanguageSettings{}, false, err
 		}
 		out.Languages = append(out.Languages, l)
@@ -486,15 +549,25 @@ func (s *PGAdminStore) ReplaceVoiceLanguages(ctx context.Context, cfg agent.Voic
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(734215)`); err != nil {
+		return err
+	}
+	var provider string
+	if err := tx.QueryRow(ctx, `SELECT speech_provider FROM agent_configs WHERE name = 'default'`).Scan(&provider); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if err := agent.ValidateVoiceLanguageSettingsForProvider(cfg, normalizeSpeechProvider(provider)); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM voice_languages`); err != nil {
 		return err
 	}
 	for i, l := range cfg.Languages {
 		isDef := l.Code == cfg.DefaultCode
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO voice_languages (code, name, voice, is_default, position, updated_at)
-			VALUES ($1, $2, $3, $4, $5, NOW())
-		`, l.Code, l.Name, l.Voice, isDef, i); err != nil {
+			INSERT INTO voice_languages (code, name, voice, elevenlabs_voice, is_default, position, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		`, l.Code, l.Name, l.Voice, l.ElevenLabsVoice, isDef, i); err != nil {
 			return err
 		}
 	}

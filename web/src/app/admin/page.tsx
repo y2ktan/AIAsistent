@@ -24,11 +24,16 @@ import {
 import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
 import {
   addLanguage,
+  applyRecommendedElevenLabsVoices,
   availableCatalogLanguages,
   canRemoveLanguage,
+  ELEVENLABS_CATALOG_VOICES,
+  ELEVENLABS_MODEL_OPTIONS,
   includeSavedOption,
+  missingDefaultProviderVoice,
   partitionVoicesByLanguage,
   removeLanguage,
+  type VoiceOption,
   type VoiceLanguageSettings,
 } from "@/lib/voice-languages";
 import {
@@ -71,6 +76,10 @@ interface AgentConfig {
   ragTopK: number;
   ragMinSimilarity: number;
   audioFocusEnabled: boolean;
+  speechProvider: "local" | "elevenlabs";
+  elevenLabsSttModel: string;
+  elevenLabsTtsModel: string;
+  elevenLabsApiKeyPreview: string;
 }
 
 function parseWakeAliasesInput(raw: string): string[] {
@@ -82,6 +91,8 @@ function parseWakeAliasesInput(raw: string): string[] {
 
 interface TTSVoiceDiscovery {
   voices: string[];
+  voiceOptions?: VoiceOption[];
+  modelOptions?: { id: string; name: string }[];
   supported: boolean;
 }
 
@@ -151,9 +162,14 @@ export default function AdminPage() {
     ragTopK: 5,
     ragMinSimilarity: 0.35,
     audioFocusEnabled: true,
+    speechProvider: "local",
+    elevenLabsSttModel: "scribe_v3",
+    elevenLabsTtsModel: "eleven_flash_v2_5",
+    elevenLabsApiKeyPreview: "",
   });
   const [wakeAliasesInput, setWakeAliasesInput] = useState("");
   const [newApiKey, setNewApiKey] = useState("");
+  const [newElevenLabsApiKey, setNewElevenLabsApiKey] = useState("");
   const [testingConn, setTestingConn] = useState(false);
   const [ttsVoiceDiscovery, setTTSVoiceDiscovery] = useState<TTSVoiceDiscovery>({
     voices: [],
@@ -207,6 +223,59 @@ export default function AdminPage() {
       loadAll();
     });
   }, [router]);
+
+  useEffect(() => {
+    if (!me) return;
+
+    if (cfg.speechProvider === "elevenlabs") {
+      setVoiceLangs((current) => ({
+        ...current,
+        languages: applyRecommendedElevenLabsVoices(
+          current.languages,
+          ELEVENLABS_CATALOG_VOICES
+        ),
+      }));
+    }
+
+    let active = true;
+    apiFetch<TTSVoiceDiscovery>(
+      `/api/v1/admin/tts-voices?provider=${encodeURIComponent(cfg.speechProvider)}`
+    )
+      .then((voices) => {
+        if (!active) return;
+        setTTSVoiceDiscovery(voices);
+        if (cfg.speechProvider === "elevenlabs" && voices.voiceOptions?.length) {
+          setVoiceLangs((current) => ({
+            ...current,
+            languages: applyRecommendedElevenLabsVoices(
+              current.languages,
+              voices.voiceOptions ?? []
+            ),
+          }));
+        }
+      })
+      .catch((err) => {
+        if (!active) return;
+        setTTSVoiceDiscovery({ voices: [], supported: false });
+        setNotice({
+          type: "err",
+          text: err instanceof Error ? err.message : "Failed to discover speech voices",
+        });
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [cfg.speechProvider, me]);
+
+  const elevenLabsVoiceOptions =
+    ttsVoiceDiscovery.voiceOptions?.length
+      ? ttsVoiceDiscovery.voiceOptions
+      : ELEVENLABS_CATALOG_VOICES;
+  const elevenLabsModelOptions =
+    ttsVoiceDiscovery.modelOptions?.length
+      ? ttsVoiceDiscovery.modelOptions
+      : ELEVENLABS_MODEL_OPTIONS;
 
   async function loadAll() {
     try {
@@ -369,6 +438,36 @@ export default function AdminPage() {
     e.preventDefault();
     setNotice(null);
     try {
+      if (cfg.speechProvider === "elevenlabs") {
+        const missingVoice = missingDefaultProviderVoice(
+          voiceLangs.languages,
+          voiceLangs.defaultLanguage,
+          "elevenlabs"
+        );
+        if (missingVoice) {
+          setNotice({
+            type: "err",
+            text: `Assign an ElevenLabs voice for ${missingVoice.name}, the default language, before saving the configuration.`,
+          });
+          window.requestAnimationFrame(() => {
+            document.getElementById(`elevenlabs-voice-${missingVoice.code}`)?.focus();
+          });
+          return;
+        }
+
+        const savedVoiceLangs = await apiFetch<VoiceLanguageSettings>(
+          "/api/v1/admin/voice-languages",
+          {
+            method: "PUT",
+            body: JSON.stringify({
+              languages: voiceLangs.languages,
+              defaultLanguage: voiceLangs.defaultLanguage,
+            }),
+          }
+        );
+        setVoiceLangs(savedVoiceLangs);
+      }
+
       const payload = {
         mode: cfg.mode,
         assistantName: cfg.assistantName,
@@ -390,6 +489,10 @@ export default function AdminPage() {
         ragTopK: Number(cfg.ragTopK) || 5,
         ragMinSimilarity: Number(cfg.ragMinSimilarity) || 0.35,
         audioFocusEnabled: cfg.audioFocusEnabled !== false,
+        speechProvider: cfg.speechProvider,
+        elevenLabsSttModel: cfg.elevenLabsSttModel,
+        elevenLabsTtsModel: cfg.elevenLabsTtsModel,
+        elevenLabsApiKey: newElevenLabsApiKey,
       };
       const res = await apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config", {
         method: "PUT",
@@ -406,6 +509,7 @@ export default function AdminPage() {
         setWakeAliasesInput(savedAliases.join(", "));
       }
       setNewApiKey("");
+      setNewElevenLabsApiKey("");
       setNotice({ type: "ok", text: "AI Agent configuration saved and encrypted." });
       try {
         const [voicesRes, modelsRes] = await Promise.all([
@@ -908,6 +1012,75 @@ export default function AdminPage() {
                   className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
                 />
               </div>
+              <div>
+                <label className="mb-1 block text-xs uppercase text-slate-400">
+                  Cascaded Speech Provider
+                </label>
+                <select
+                  value={cfg.speechProvider}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, speechProvider: e.target.value as "local" | "elevenlabs" })
+                  }
+                  className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                >
+                  <option value="local">Existing OpenAI-compatible STT + TTS</option>
+                  <option value="elevenlabs">ElevenLabs STT + TTS</option>
+                </select>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Applies to new cascaded sessions. ElevenLabs sends speech and generated text externally and may incur charges.
+                </p>
+              </div>
+              {cfg.speechProvider === "elevenlabs" ? (
+                <>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">
+                      ElevenLabs API Key (Write-Only{cfg.elevenLabsApiKeyPreview ? ` • Current: ${cfg.elevenLabsApiKeyPreview}` : ""})
+                    </label>
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      value={newElevenLabsApiKey}
+                      onChange={(e) => setNewElevenLabsApiKey(e.target.value)}
+                      placeholder={cfg.elevenLabsApiKeyPreview || "Enter ElevenLabs API key"}
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">
+                      ElevenLabs STT Model
+                    </label>
+                    <input
+                      type="text"
+                      value={cfg.elevenLabsSttModel}
+                      onChange={(e) => setCfg({ ...cfg, elevenLabsSttModel: e.target.value })}
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs uppercase text-slate-400">
+                      ElevenLabs TTS Model
+                    </label>
+                    <select
+                      value={cfg.elevenLabsTtsModel}
+                      onChange={(e) => setCfg({ ...cfg, elevenLabsTtsModel: e.target.value })}
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                    >
+                      {cfg.elevenLabsTtsModel &&
+                        !elevenLabsModelOptions.some(
+                          (model) => model.id === cfg.elevenLabsTtsModel
+                        ) && <option value={cfg.elevenLabsTtsModel}>{cfg.elevenLabsTtsModel}</option>}
+                      {elevenLabsModelOptions.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.name} ({model.id})
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-[11px] text-slate-400">
+                      Catalog defaults are available immediately; a valid saved API key refreshes this list.
+                    </p>
+                  </div>
+                </>
+              ) : null}
 
               {cfg.mode === "realtime" ? (
                 <>
@@ -952,50 +1125,54 @@ export default function AdminPage() {
                       className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
                     />
                   </div>
-                  <div>
-                    <label className="mb-1 block text-xs uppercase text-slate-400">STT Base URL</label>
-                    <input
-                      type="url"
-                      value={cfg.sttBaseUrl}
-                      onChange={(e) => setCfg({ ...cfg, sttBaseUrl: e.target.value })}
-                      placeholder="https://api.openai.com/v1"
-                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs uppercase text-slate-400">STT Model</label>
-                    {sttModelDiscovery.supported && sttModelDiscovery.models.length > 0 ? (
-                      <select
-                        value={cfg.sttModel}
-                        onChange={(e) => setCfg({ ...cfg, sttModel: e.target.value })}
-                        className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
-                      >
-                        {sttModelOptions.map((model) => (
-                          <option key={model} value={model}>
-                            {model}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        type="text"
-                        value={cfg.sttModel}
-                        onChange={(e) => setCfg({ ...cfg, sttModel: e.target.value })}
-                        placeholder="whisper-1"
-                        className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
-                      />
-                    )}
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs uppercase text-slate-400">TTS Base URL</label>
-                    <input
-                      type="url"
-                      value={cfg.ttsBaseUrl}
-                      onChange={(e) => setCfg({ ...cfg, ttsBaseUrl: e.target.value })}
-                      placeholder="https://api.openai.com/v1"
-                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
-                    />
-                  </div>
+                  {cfg.speechProvider === "local" ? (
+                    <>
+                      <div>
+                        <label className="mb-1 block text-xs uppercase text-slate-400">STT Base URL</label>
+                        <input
+                          type="url"
+                          value={cfg.sttBaseUrl}
+                          onChange={(e) => setCfg({ ...cfg, sttBaseUrl: e.target.value })}
+                          placeholder="https://api.openai.com/v1"
+                          className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs uppercase text-slate-400">STT Model</label>
+                        {sttModelDiscovery.supported && sttModelDiscovery.models.length > 0 ? (
+                          <select
+                            value={cfg.sttModel}
+                            onChange={(e) => setCfg({ ...cfg, sttModel: e.target.value })}
+                            className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                          >
+                            {sttModelOptions.map((model) => (
+                              <option key={model} value={model}>
+                                {model}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            type="text"
+                            value={cfg.sttModel}
+                            onChange={(e) => setCfg({ ...cfg, sttModel: e.target.value })}
+                            placeholder="whisper-1"
+                            className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                          />
+                        )}
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs uppercase text-slate-400">TTS Base URL</label>
+                        <input
+                          type="url"
+                          value={cfg.ttsBaseUrl}
+                          onChange={(e) => setCfg({ ...cfg, ttsBaseUrl: e.target.value })}
+                          placeholder="https://api.openai.com/v1"
+                          className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
+                        />
+                      </div>
+                    </>
+                  ) : null}
                 </>
               )}
 
@@ -1097,7 +1274,10 @@ export default function AdminPage() {
                     </div>
 
                     <div className="flex-1 min-w-[180px]">
-                      {ttsVoiceDiscovery.supported && ttsVoiceDiscovery.voices.length > 0 ? (
+                      {cfg.speechProvider === "local" ? (
+                        <>
+                          <p className="mb-1 text-[11px] uppercase text-slate-500">Existing provider voice</p>
+                          {ttsVoiceDiscovery.supported && ttsVoiceDiscovery.voices.length > 0 ? (
                         <select
                           value={lang.voice}
                           onChange={(e) => {
@@ -1156,11 +1336,55 @@ export default function AdminPage() {
                           aria-label={`Voice for ${lang.name}`}
                           className="w-full rounded-lg border border-slate-700/60 bg-slate-900 px-2.5 py-1.5 text-sm text-white"
                         />
-                      )}
-                      {lang.voice.trim() === "" && (
-                        <p className="mt-1 text-[11px] text-amber-400/90">
-                          No voice assigned — replies will be spoken in the default language.
-                        </p>
+                          )}
+                          {lang.voice.trim() === "" && (
+                            <p className="mt-1 text-[11px] text-amber-400/90">
+                              No voice assigned — replies will be spoken in the default language.
+                            </p>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <p className="mb-1 text-[11px] uppercase text-slate-500">ElevenLabs voice</p>
+                        <select
+                          value={lang.elevenLabsVoice || ""}
+                          id={`elevenlabs-voice-${lang.code}`}
+                          onChange={(e) => {
+                            const elevenLabsVoice = e.target.value;
+                            setVoiceLangs((prev) => ({
+                              ...prev,
+                              languages: prev.languages.map((item) =>
+                                item.code === lang.code ? { ...item, elevenLabsVoice } : item
+                              ),
+                            }));
+                          }}
+                          aria-label={`ElevenLabs voice for ${lang.name}`}
+                          className="w-full rounded-lg border border-slate-700/60 bg-slate-900 px-2.5 py-1.5 text-sm text-white"
+                        >
+                          <option value="">None</option>
+                          {lang.elevenLabsVoice &&
+                            !elevenLabsVoiceOptions.some(
+                              (voice) => voice.id === lang.elevenLabsVoice
+                            ) && (
+                              <option value={lang.elevenLabsVoice}>
+                                Saved custom voice: {lang.elevenLabsVoice}
+                              </option>
+                            )}
+                          {elevenLabsVoiceOptions.map((voice) => (
+                            <option key={voice.id} value={voice.id}>
+                              {voice.name}
+                              {voice.language ? ` [${voice.language}]` : ""}
+                              {" "}
+                              ({voice.id})
+                            </option>
+                          ))}
+                        </select>
+                          {(lang.elevenLabsVoice || "").trim() === "" && (
+                            <p className="mt-1 text-[11px] text-amber-400/90">
+                              No voice assigned — replies will be spoken in the default language.
+                            </p>
+                          )}
+                        </>
                       )}
                     </div>
 

@@ -207,6 +207,10 @@ func (m *mockAllStore) UpsertAgentConfig(_ context.Context, rec *AgentConfigReco
 		rec.APIKeyCiphertext = m.agentCfg.APIKeyCiphertext
 		rec.APIKeyLast4 = m.agentCfg.APIKeyLast4
 	}
+	if len(rec.ElevenLabsAPIKeyCiphertext) == 0 && m.agentCfg != nil {
+		rec.ElevenLabsAPIKeyCiphertext = m.agentCfg.ElevenLabsAPIKeyCiphertext
+		rec.ElevenLabsAPIKeyLast5 = m.agentCfg.ElevenLabsAPIKeyLast5
+	}
 	cp := *rec
 	cp.WakeAliases = append([]string{}, rec.WakeAliases...)
 	m.agentCfg = &cp
@@ -588,6 +592,49 @@ func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {
 		t.Fatalf("expected omitted audioFocusEnabled update to preserve default true, got: %s", body)
 	}
 
+	store.mu.Lock()
+	store.voiceLangs = &agent.VoiceLanguageSettings{
+		DefaultCode: "en",
+		Languages: []agent.VoiceLanguage{{
+			Code: "en", Name: "English", Voice: "af_heart", ElevenLabsVoice: "voice-123",
+		}},
+	}
+	store.mu.Unlock()
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/agent-config", bytes.NewBufferString(`{"mode":"cascaded","elevenLabsApiKey":"short"}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected short ElevenLabs key to be rejected, got %d: %s", rec.Code, rec.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/agent-config", bytes.NewBufferString(`{"mode":"cascaded","speechProvider":"elevenlabs","elevenLabsApiKey":"eleven-super-secret-12345"}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected ElevenLabs config save, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "eleven-super-secret") || !strings.Contains(rec.Body.String(), "****12345") {
+		t.Fatalf("expected only last five ElevenLabs characters, got: %s", rec.Body.String())
+	}
+	encryptedCopy := append([]byte(nil), store.agentCfg.ElevenLabsAPIKeyCiphertext...)
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/agent-config", bytes.NewBufferString(`{"mode":"cascaded","speechProvider":"elevenlabs"}`))
+	req.AddCookie(adminCookie)
+	req.Header.Set("Origin", "https://aegis.local")
+	req.Header.Set("X-CSRF-Token", bootResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !bytes.Equal(encryptedCopy, store.agentCfg.ElevenLabsAPIKeyCiphertext) {
+		t.Fatalf("expected omitted ElevenLabs key to be preserved, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "****12345") {
+		t.Fatalf("expected preserved ElevenLabs preview, got: %s", rec.Body.String())
+	}
+
 	// Audio Focus can be disabled explicitly and is available to authenticated voice sessions.
 	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/agent-config", bytes.NewBufferString(`{"mode":"cascaded","audioFocusEnabled":false}`))
 	req.AddCookie(adminCookie)
@@ -780,7 +827,13 @@ func TestAdminProviderDiscoveryAPIs(t *testing.T) {
 		case "/v1/audio/voices":
 			_, _ = w.Write([]byte(`{"voices":["af_heart","zf_xiaoxiao"]}`))
 		case "/v1/models":
-			_, _ = w.Write([]byte(`{"data":[{"id":"other-model"},{"id":"openai/whisper-large"},{"id":"Systran/faster-whisper-small"},{"id":"Systran/faster-whisper-medium"}]}`))
+			if r.Header.Get("xi-api-key") != "" {
+				_, _ = w.Write([]byte(`[{"model_id":"eleven_flash_v2_5","name":"Eleven Flash v2.5","can_do_text_to_speech":true},{"model_id":"scribe_v3","name":"Scribe v3","can_do_text_to_speech":false}]`))
+			} else {
+				_, _ = w.Write([]byte(`{"data":[{"id":"other-model"},{"id":"openai/whisper-large"},{"id":"Systran/faster-whisper-small"},{"id":"Systran/faster-whisper-medium"}]}`))
+			}
+		case "/v2/voices":
+			_, _ = w.Write([]byte(`{"voices":[{"voice_id":"voice-123","name":"Test Voice","labels":{"language":"en"}}],"has_more":false}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -882,6 +935,28 @@ func TestAdminProviderDiscoveryAPIs(t *testing.T) {
 		if voicesResponse.Supported || len(voicesResponse.Voices) != 0 {
 			t.Fatalf("expected unsupported response for %q, got %+v", baseURL, voicesResponse)
 		}
+	}
+
+	oldElevenLabsBase := elevenLabsAdminAPIBaseURL
+	elevenLabsAdminAPIBaseURL = provider.URL
+	t.Cleanup(func() { elevenLabsAdminAPIBaseURL = oldElevenLabsBase })
+	store.mu.Lock()
+	store.agentCfg.ElevenLabsAPIKeyCiphertext, _ = vault.Encrypt("eleven-test-key")
+	store.mu.Unlock()
+	rec = getAdmin("/api/v1/admin/tts-voices?provider=elevenlabs")
+	if rec.Code != http.StatusOK ||
+		!strings.Contains(rec.Body.String(), `"id":"voice-123"`) ||
+		!strings.Contains(rec.Body.String(), `"name":"Test Voice"`) ||
+		!strings.Contains(rec.Body.String(), `"language":"en"`) ||
+		!strings.Contains(rec.Body.String(), `"id":"eleven_flash_v2_5"`) {
+		t.Fatalf("expected draft ElevenLabs voice options, got %d %s", rec.Code, rec.Body.String())
+	}
+	store.mu.Lock()
+	store.agentCfg.SpeechProvider = "elevenlabs"
+	store.mu.Unlock()
+	rec = getAdmin("/api/v1/admin/tts-voices")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"id":"voice-123"`) || !strings.Contains(rec.Body.String(), `"name":"Test Voice"`) {
+		t.Fatalf("expected ElevenLabs voice options, got %d %s", rec.Code, rec.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewBufferString(`{"email":"user@aegis.local","password":"UserPassword!2026","role":"user"}`))

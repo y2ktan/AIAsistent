@@ -22,6 +22,8 @@ import (
 	"aegis-voice/server/internal/skills"
 )
 
+var elevenLabsAdminAPIBaseURL = "https://api.elevenlabs.io"
+
 type Server struct {
 	authSvc      *auth.Service
 	authStore    auth.Store
@@ -398,6 +400,9 @@ func normalizeAgentConfigDefaults(cfg *AgentConfigRecord) {
 	if cfg.WakeAliases == nil {
 		cfg.WakeAliases = []string{}
 	}
+	cfg.SpeechProvider = normalizeSpeechProvider(cfg.SpeechProvider)
+	cfg.ElevenLabsSTTModel = normalizeElevenLabsSTTModel(cfg.ElevenLabsSTTModel)
+	cfg.ElevenLabsTTSModel = normalizeElevenLabsTTSModel(cfg.ElevenLabsTTSModel)
 }
 
 func normalizeWakeAliases(primaryName string, rawAliases []string) ([]string, error) {
@@ -443,6 +448,123 @@ func (s *Server) HandleDiscoverTTSVoices(w http.ResponseWriter, r *http.Request)
 	cfg, err := s.adminStore.GetAgentConfig(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
+		return
+	}
+	provider := normalizeSpeechProvider(cfg.SpeechProvider)
+	if requested := strings.TrimSpace(r.URL.Query().Get("provider")); requested != "" {
+		if requested != "local" && requested != "elevenlabs" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported speech provider"})
+			return
+		}
+		provider = requested
+	}
+	if provider == "elevenlabs" {
+		if len(cfg.ElevenLabsAPIKeyCiphertext) == 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "voiceOptions": []any{}, "supported": false})
+			return
+		}
+		key, decryptErr := s.vault.Decrypt(cfg.ElevenLabsAPIKeyCiphertext)
+		if decryptErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt ElevenLabs api key"})
+			return
+		}
+		req, requestErr := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(elevenLabsAdminAPIBaseURL, "/")+"/v2/voices?page_size=100&include_total_count=false", nil)
+		if requestErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to build voice discovery request"})
+			return
+		}
+		req.Header.Set("xi-api-key", key)
+		resp, requestErr := security.NewSafeHTTPClient(s.allowPrivate, 10*time.Second).Do(req)
+		if requestErr != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "voiceOptions": []any{}, "supported": false})
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "voiceOptions": []any{}, "supported": false})
+			return
+		}
+		var payload struct {
+			Voices []struct {
+				ID     string `json:"voice_id"`
+				Name   string `json:"name"`
+				Labels struct {
+					Language string `json:"language"`
+				} `json:"labels"`
+				Sharing struct {
+					Labels struct {
+						Language string `json:"language"`
+					} `json:"labels"`
+				} `json:"sharing"`
+			} `json:"voices"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&payload); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"voices": []string{}, "voiceOptions": []any{}, "supported": false})
+			return
+		}
+		voices := make([]string, 0, len(payload.Voices))
+		options := make([]map[string]string, 0, len(payload.Voices))
+		for _, voice := range payload.Voices {
+			if strings.TrimSpace(voice.ID) == "" {
+				continue
+			}
+			voices = append(voices, voice.ID)
+			name := strings.TrimSpace(voice.Name)
+			if name == "" {
+				name = voice.ID
+			}
+			language := strings.TrimSpace(voice.Labels.Language)
+			if language == "" {
+				language = strings.TrimSpace(voice.Sharing.Labels.Language)
+			}
+			options = append(options, map[string]string{
+				"id":       voice.ID,
+				"name":     name,
+				"language": language,
+			})
+		}
+
+		modelOptions := make([]map[string]string, 0)
+		modelReq, modelRequestErr := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(elevenLabsAdminAPIBaseURL, "/")+"/v1/models", nil)
+		if modelRequestErr == nil {
+			modelReq.Header.Set("xi-api-key", key)
+			modelResp, modelErr := security.NewSafeHTTPClient(s.allowPrivate, 10*time.Second).Do(modelReq)
+			if modelErr == nil {
+				func() {
+					defer func() { _ = modelResp.Body.Close() }()
+					if modelResp.StatusCode < 200 || modelResp.StatusCode >= 300 {
+						return
+					}
+					var models []struct {
+						ID          string `json:"model_id"`
+						Name        string `json:"name"`
+						CanDoTTS    bool   `json:"can_do_text_to_speech"`
+					}
+					if json.NewDecoder(io.LimitReader(modelResp.Body, 8<<20)).Decode(&models) != nil {
+						return
+					}
+					for _, model := range models {
+						if !model.CanDoTTS || strings.TrimSpace(model.ID) == "" {
+							continue
+						}
+						name := strings.TrimSpace(model.Name)
+						if name == "" {
+							name = model.ID
+						}
+						modelOptions = append(modelOptions, map[string]string{
+							"id":   model.ID,
+							"name": name,
+						})
+					}
+				}()
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"voices":      voices,
+			"voiceOptions": options,
+			"modelOptions": modelOptions,
+			"supported":   len(voices) > 0,
+		})
 		return
 	}
 
@@ -617,26 +739,30 @@ func whisperModelPriority(model string) int {
 
 func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Mode               string  `json:"mode"`
-		RealtimeWSURL      string  `json:"realtimeWsUrl"`
-		RealtimeModel      string  `json:"realtimeModel"`
-		STTBaseURL         string  `json:"sttBaseUrl"`
-		STTModel           string  `json:"sttModel"`
-		LLMBaseURL         string  `json:"llmBaseUrl"`
-		LLMModel           string  `json:"llmModel"`
-		TTSBaseURL         string  `json:"ttsBaseUrl"`
-		TTSModel           string  `json:"ttsModel"`
-		TTSVoice           string  `json:"ttsVoice"`
-		EmbeddingBaseURL   string  `json:"embeddingBaseUrl"`
-		EmbeddingModel     string  `json:"embeddingModel"`
-		EmbeddingDim       int     `json:"embeddingDim"`
-		SystemInstructions string  `json:"systemInstructions"`
-		APIKey             string  `json:"apiKey"`
+		Mode               string    `json:"mode"`
+		RealtimeWSURL      string    `json:"realtimeWsUrl"`
+		RealtimeModel      string    `json:"realtimeModel"`
+		STTBaseURL         string    `json:"sttBaseUrl"`
+		STTModel           string    `json:"sttModel"`
+		LLMBaseURL         string    `json:"llmBaseUrl"`
+		LLMModel           string    `json:"llmModel"`
+		TTSBaseURL         string    `json:"ttsBaseUrl"`
+		TTSModel           string    `json:"ttsModel"`
+		TTSVoice           string    `json:"ttsVoice"`
+		EmbeddingBaseURL   string    `json:"embeddingBaseUrl"`
+		EmbeddingModel     string    `json:"embeddingModel"`
+		EmbeddingDim       int       `json:"embeddingDim"`
+		SystemInstructions string    `json:"systemInstructions"`
+		APIKey             string    `json:"apiKey"`
 		RAGTopK            int       `json:"ragTopK"`
 		RAGMinSimilarity   float64   `json:"ragMinSimilarity"`
 		AudioFocusEnabled  *bool     `json:"audioFocusEnabled"`
 		AssistantName      *string   `json:"assistantName"`
 		WakeAliases        *[]string `json:"wakeAliases"`
+		SpeechProvider     string    `json:"speechProvider"`
+		ElevenLabsSTTModel string    `json:"elevenLabsSttModel"`
+		ElevenLabsTTSModel string    `json:"elevenLabsTtsModel"`
+		ElevenLabsAPIKey   string    `json:"elevenLabsApiKey"`
 	}
 	if err := decodeStrictJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -681,17 +807,64 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		SystemInstructions: req.SystemInstructions,
 		RAGTopK:            req.RAGTopK,
 		RAGMinSimilarity:   req.RAGMinSimilarity,
+		SpeechProvider:     normalizeSpeechProvider(req.SpeechProvider),
+		ElevenLabsSTTModel: normalizeElevenLabsSTTModel(req.ElevenLabsSTTModel),
+		ElevenLabsTTSModel: normalizeElevenLabsTTSModel(req.ElevenLabsTTSModel),
 	}
 	if rec.EmbeddingDim <= 0 {
 		rec.EmbeddingDim = 1536
-	}
-	if rec.RAGTopK <= 0 {
-		rec.RAGTopK = 5
 	}
 	existing, err := s.adminStore.GetAgentConfig(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
 		return
+	}
+	if strings.TrimSpace(req.ElevenLabsAPIKey) != "" {
+		key := strings.TrimSpace(req.ElevenLabsAPIKey)
+		if len(key) <= 5 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ElevenLabs API key is too short"})
+			return
+		}
+		ct, err := s.vault.Encrypt(key)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt ElevenLabs api key"})
+			return
+		}
+		rec.ElevenLabsAPIKeyCiphertext = ct
+		rec.ElevenLabsAPIKeyLast5 = maskLast5(key)
+	}
+	if existing != nil {
+		if rec.ElevenLabsAPIKeyLast5 == "" {
+			rec.ElevenLabsAPIKeyLast5 = existing.ElevenLabsAPIKeyLast5
+		}
+		if req.SpeechProvider == "" {
+			rec.SpeechProvider = normalizeSpeechProvider(existing.SpeechProvider)
+		}
+		if req.ElevenLabsSTTModel == "" {
+			rec.ElevenLabsSTTModel = normalizeElevenLabsSTTModel(existing.ElevenLabsSTTModel)
+		}
+		if req.ElevenLabsTTSModel == "" {
+			rec.ElevenLabsTTSModel = normalizeElevenLabsTTSModel(existing.ElevenLabsTTSModel)
+		}
+	}
+	if rec.SpeechProvider == "elevenlabs" {
+		hasKey := len(rec.ElevenLabsAPIKeyCiphertext) > 0 || (existing != nil && len(existing.ElevenLabsAPIKeyCiphertext) > 0)
+		if !hasKey {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "configure an ElevenLabs API key before selecting ElevenLabs"})
+			return
+		}
+		vl, _, vlErr := s.effectiveVoiceLanguages(r.Context())
+		if vlErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to validate voice languages"})
+			return
+		}
+		if err := agent.ValidateVoiceLanguageSettingsForProvider(vl, rec.SpeechProvider); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if rec.RAGTopK <= 0 {
+		rec.RAGTopK = 5
 	}
 	rec.AudioFocusEnabled = true
 	rec.AssistantName = agent.DefaultAssistantName
@@ -754,6 +927,8 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		"audioFocusEnabled": rec.AudioFocusEnabled,
 		"assistantName":     rec.AssistantName,
 		"wakeAliases":       rec.WakeAliases,
+		"speechProvider":    rec.SpeechProvider,
+		"elevenLabsKeySet":  len(rec.ElevenLabsAPIKeyCiphertext) > 0 || (existing != nil && len(existing.ElevenLabsAPIKeyCiphertext) > 0),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"config": rec})
 }
@@ -809,13 +984,19 @@ func (s *Server) HandleUpdateVoiceLanguages(w http.ResponseWriter, r *http.Reque
 			name = entry.Name
 		}
 		next.Languages = append(next.Languages, agent.VoiceLanguage{
-			Code:  code,
-			Name:  name,
-			Voice: strings.TrimSpace(l.Voice),
+			Code:            code,
+			Name:            name,
+			Voice:           strings.TrimSpace(l.Voice),
+			ElevenLabsVoice: strings.TrimSpace(l.ElevenLabsVoice),
 		})
 	}
 
-	if err := agent.ValidateVoiceLanguageSettings(next); err != nil {
+	cfg, cfgErr := s.adminStore.GetAgentConfig(r.Context())
+	if cfgErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
+		return
+	}
+	if err := agent.ValidateVoiceLanguageSettingsForProvider(next, normalizeSpeechProvider(cfg.SpeechProvider)); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -855,6 +1036,14 @@ func (s *Server) HandleUpdateVoiceLanguages(w http.ResponseWriter, r *http.Reque
 		"saved":           true,
 		"catalog":         agent.LanguageCatalog(),
 	})
+}
+
+func maskLast5(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) <= 5 {
+		return strings.Repeat("*", len(key))
+	}
+	return "****" + key[len(key)-5:]
 }
 
 func (s *Server) HandleTestAgentConfig(w http.ResponseWriter, r *http.Request) {
@@ -1080,6 +1269,15 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 	if len(cfgRec.APIKeyCiphertext) > 0 {
 		apiKey, _ = s.vault.Decrypt(cfgRec.APIKeyCiphertext)
 	}
+	var elevenLabsAPIKey string
+	if len(cfgRec.ElevenLabsAPIKeyCiphertext) > 0 {
+		var decryptErr error
+		elevenLabsAPIKey, decryptErr = s.vault.Decrypt(cfgRec.ElevenLabsAPIKeyCiphertext)
+		if decryptErr != nil {
+			ps.SendEvent(rtc.NewErrorEvent("Failed to load ElevenLabs configuration."))
+			return
+		}
+	}
 
 	mcpRecs, err := s.adminStore.ListMCPServers(ctx)
 	if err != nil {
@@ -1151,6 +1349,10 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 			WakeAliases:        append([]string{}, cfgRec.WakeAliases...),
 			AllowPrivate:       s.allowPrivate,
 			VoiceLanguages:     vl,
+			SpeechProvider:     normalizeSpeechProvider(cfgRec.SpeechProvider),
+			ElevenLabsSTTModel: normalizeElevenLabsSTTModel(cfgRec.ElevenLabsSTTModel),
+			ElevenLabsTTSModel: normalizeElevenLabsTTSModel(cfgRec.ElevenLabsTTSModel),
+			ElevenLabsAPIKey:   elevenLabsAPIKey,
 		},
 		Sink:       ps,
 		RAGService: s.ragSvc,

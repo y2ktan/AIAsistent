@@ -15,9 +15,10 @@ type LanguageCatalogEntry struct {
 }
 
 type VoiceLanguage struct {
-	Code  string `json:"code"`
-	Name  string `json:"name"`
-	Voice string `json:"voice"`
+	Code            string `json:"code"`
+	Name            string `json:"name"`
+	Voice           string `json:"voice"`
+	ElevenLabsVoice string `json:"elevenLabsVoice"`
 }
 
 type VoiceLanguageSettings struct {
@@ -78,6 +79,14 @@ func InitialVoiceLanguageSettings(englishVoice string) VoiceLanguageSettings {
 }
 
 func ValidateVoiceLanguageSettings(s VoiceLanguageSettings) error {
+	return validateVoiceLanguageSettings(s, "local")
+}
+
+func ValidateVoiceLanguageSettingsForProvider(s VoiceLanguageSettings, provider string) error {
+	return validateVoiceLanguageSettings(s, normalizeSpeechProvider(provider))
+}
+
+func validateVoiceLanguageSettings(s VoiceLanguageSettings, provider string) error {
 	if len(s.Languages) == 0 {
 		return errors.New("at least one supported language is required")
 	}
@@ -96,17 +105,35 @@ func ValidateVoiceLanguageSettings(s VoiceLanguageSettings) error {
 		seen[code] = true
 		if code == strings.ToLower(strings.TrimSpace(s.DefaultCode)) {
 			hasDefault = true
-			defaultVoice = strings.TrimSpace(lang.Voice)
+			defaultVoice = strings.TrimSpace(lang.ProviderVoice(provider))
 		}
+
 	}
 
 	if !hasDefault {
 		return errors.New("choose another default language before removing this one")
 	}
 	if defaultVoice == "" {
+		if provider == "elevenlabs" {
+			return errors.New("the default language must have an ElevenLabs voice")
+		}
 		return errors.New("the default language must have an assigned voice")
 	}
 	return nil
+}
+
+func normalizeSpeechProvider(provider string) string {
+	if provider == "elevenlabs" {
+		return provider
+	}
+	return "local"
+}
+
+func (l VoiceLanguage) ProviderVoice(provider string) string {
+	if provider == "elevenlabs" {
+		return l.ElevenLabsVoice
+	}
+	return l.Voice
 }
 
 func (s VoiceLanguageSettings) Find(code string) (VoiceLanguage, bool) {

@@ -37,7 +37,19 @@ vi.mock("@/lib/api-client", () => ({
     if (path.endsWith("/users")) return { users: [] };
     if (path.endsWith("/documents")) return { documents: [] };
     if (path.endsWith("/voice-languages")) {
-      return { languages: [], defaultLanguage: "en", saved: true, catalog: [] };
+      return {
+        languages: [
+          {
+            code: "en",
+            name: "English",
+            voice: "af_heart",
+            elevenLabsVoice: "",
+          },
+        ],
+        defaultLanguage: "en",
+        saved: true,
+        catalog: [],
+      };
     }
     if (options?.method === "PUT" && path.endsWith("/agent-config")) {
       const body = JSON.parse(String(options.body)) as Record<string, unknown>;
@@ -62,7 +74,7 @@ vi.mock("@/lib/api-client", () => ({
     }
     if (path.endsWith("/mcp-servers")) return { servers: mcpMocks.servers };
     if (path.endsWith("/audit-logs")) return { logs: [] };
-    if (path.endsWith("/tts-voices")) return { voices: [], supported: false };
+    if (path.includes("/tts-voices")) return { voices: [], supported: false };
     if (path.endsWith("/stt-models")) return { models: [], supported: false };
     return {};
   },
@@ -212,6 +224,48 @@ describe("admin form autofill settings", () => {
       assistantName: "Jarvis",
       wakeAliases: ["小智", "Aegis", "阿智"],
     });
+  });
+
+  it("hides OpenAI-compatible speech settings when ElevenLabs is selected", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(createElement(AdminPage));
+    });
+
+    const agentTab = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("AI Agent")
+    );
+    await act(async () => {
+      agentTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const providerSelect = Array.from(container.querySelectorAll("select")).find((select) =>
+      Array.from(select.options).some((option) => option.text.includes("ElevenLabs STT + TTS"))
+    );
+    expect(providerSelect).toBeDefined();
+    expect(container.textContent).toContain("STT Base URL");
+    expect(container.textContent).toContain("TTS Base URL");
+
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLSelectElement.prototype,
+        "value"
+      )?.set;
+      setter?.call(providerSelect, "elevenlabs");
+      providerSelect?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(container.textContent).not.toContain("STT Base URL");
+    expect(container.textContent).not.toContain("TTS Base URL");
+    expect(container.textContent).toContain("ElevenLabs API Key");
+    expect(container.textContent).toContain("ElevenLabs STT Model");
+    expect(container.textContent).toContain("LLM Base URL");
+    expect(container.querySelector('[aria-label="ElevenLabs voice for English"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Voice for English"]')).toBeNull();
+    expect(container.textContent).not.toContain("Existing provider voice");
   });
 
   it("hides discovered tools per server without changing server cards or allowlists", async () => {

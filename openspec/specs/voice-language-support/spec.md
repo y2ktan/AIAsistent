@@ -66,6 +66,25 @@ The system SHALL let administrators assign a speech voice to each supported lang
 - **WHEN** an administrator adds a language and leaves its voice empty
 - **THEN** the language is saved and the settings view indicates that the assistant will answer that language in the default language
 
+### Requirement: Voice assignments are isolated by speech provider
+The system SHALL maintain separate voice assignments for each speech provider while retaining the shared supported-language list and default language. A provider's voice identifier SHALL NOT be used with another provider.
+
+#### Scenario: Existing assignments survive upgrade
+- **WHEN** an installation with saved voice languages is upgraded
+- **THEN** its existing voice assignments remain available for the existing provider
+
+#### Scenario: Switching between providers
+- **WHEN** an administrator configures distinct voices for both providers and switches between them
+- **THEN** new sessions use the active provider's assignments and switching back restores the previously configured voices
+
+#### Scenario: Language has no voice for the active provider
+- **WHEN** a non-default supported language has no voice assigned for the active provider
+- **THEN** the existing default-language fallback and once-per-session notice apply without using a voice from another provider
+
+#### Scenario: Default voice is required for the selected provider
+- **WHEN** an administrator attempts to save settings that leave the active provider's default language without a voice
+- **THEN** the system rejects the save and keeps the previous settings
+
 ### Requirement: Replies follow the user's spoken language
 The system SHALL reply, in both transcript text and speech, in the language of the user's most recent utterance when that language is supported and has an assigned voice, and SHALL prefer the configured default language when disambiguating ambiguous same-script utterances or falling back when no language is detected on an initial turn.
 

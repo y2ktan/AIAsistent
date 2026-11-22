@@ -35,6 +35,10 @@ type AgentConfig struct {
 	WakeAliases        []string
 	AllowPrivate       bool
 	VoiceLanguages     VoiceLanguageSettings
+	SpeechProvider     string
+	ElevenLabsSTTModel string
+	ElevenLabsTTSModel string
+	ElevenLabsAPIKey   string
 }
 
 var traditionalToSimplifiedRune = map[rune]rune{

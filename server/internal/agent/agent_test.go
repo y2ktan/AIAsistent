@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -202,6 +203,97 @@ func TestSynthesizeAndStreamOggPacketsAndPacing(t *testing.T) {
 	}
 	if elapsed < 160*time.Millisecond || elapsed > 500*time.Millisecond {
 		t.Fatalf("expected ~200ms pacing, got %v", elapsed)
+	}
+}
+
+func TestElevenLabsSpeechRequests(t *testing.T) {
+	var stream bytes.Buffer
+	const serial = 0x12345678
+	writeOggPage(&stream, 0x02, 0, serial, 0, []byte("OpusHead\x01\x01\x38\x01\x80\xbb\x00\x00\x00\x00\x00"))
+	writeOggPage(&stream, 0x00, 0, serial, 1, []byte("OpusTags\x04\x00\x00\x00test\x00\x00\x00\x00"))
+	stream.Write(buildTestOggPage(0x04, 480, serial, 2, []byte{4}, []byte{27 << 3, 1, 2, 3}))
+
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("xi-api-key"); got != "eleven-test-key" {
+			t.Errorf("xi-api-key = %q", got)
+		}
+		switch r.URL.Path {
+		case "/v1/speech-to-text":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Errorf("parse multipart: %v", err)
+				return
+			}
+			if r.FormValue("model_id") != "scribe_v3" {
+				t.Errorf("model_id = %q", r.FormValue("model_id"))
+			}
+			if got := r.Form["keyterms"]; len(got) != 1 || got[0] != "Aegis" {
+				t.Errorf("keyterms = %#v", got)
+			}
+			_, _ = w.Write([]byte(`{"text":"Aegis, what time is it?","language_code":"eng"}`))
+		case "/v1/text-to-speech/voice-123/stream":
+			if r.URL.Query().Get("output_format") != "opus_48000_64" {
+				t.Errorf("output_format = %q", r.URL.Query().Get("output_format"))
+			}
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			_ = json.Unmarshal(body, &payload)
+			if payload["model_id"] != "eleven_flash_v2_5" || payload["language_code"] != "en" {
+				t.Errorf("unexpected TTS payload: %#v", payload)
+			}
+			_, _ = w.Write(stream.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer provider.Close()
+	oldBase := elevenLabsAPIBaseURL
+	elevenLabsAPIBaseURL = provider.URL
+	t.Cleanup(func() { elevenLabsAPIBaseURL = oldBase })
+
+	sink := &mockSink{}
+	adapter := NewCascadedAdapter(Dependencies{
+		Config: AgentConfig{
+			SpeechProvider:     "elevenlabs",
+			ElevenLabsAPIKey:   "eleven-test-key",
+			ElevenLabsSTTModel: "scribe_v3",
+			ElevenLabsTTSModel: "eleven_flash_v2_5",
+			AssistantName:      "Aegis",
+			AllowPrivate:       true,
+		},
+		Sink: sink,
+	})
+	text, language, err := adapter.transcribe(context.Background(), []byte("fake-ogg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "Aegis, what time is it?" || language != "eng" {
+		t.Fatalf("unexpected transcript: %q %q", text, language)
+	}
+	if err := adapter.synthesizeAndStream(context.Background(), "hello", "voice-123", "en"); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.audio) != 1 {
+		t.Fatalf("audio samples = %d, want 1", len(sink.audio))
+	}
+}
+
+func TestValidateVoiceLanguageSettingsForProvider(t *testing.T) {
+	settings := VoiceLanguageSettings{
+		DefaultCode: "en",
+		Languages: []VoiceLanguage{
+			{Code: "en", Name: "English", Voice: "local-en"},
+		},
+	}
+	if err := ValidateVoiceLanguageSettingsForProvider(settings, "local"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateVoiceLanguageSettingsForProvider(settings, "elevenlabs"); err == nil {
+		t.Fatal("expected missing ElevenLabs default voice to fail")
+	}
+	settings.Languages[0].ElevenLabsVoice = "eleven-en"
+	settings.Languages[0].Voice = ""
+	if err := ValidateVoiceLanguageSettingsForProvider(settings, "elevenlabs"); err != nil {
+		t.Fatalf("expected ElevenLabs-only voice mapping to pass: %v", err)
 	}
 }
 

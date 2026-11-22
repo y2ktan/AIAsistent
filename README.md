@@ -100,6 +100,16 @@ Configure supported spoken languages in **`/admin` → AI Agent → Voice langua
 - **Per-language voices & fallback**: In `cascaded` mode, replies are spoken using the voice assigned to the reply's language. If a user speaks an unsupported language—or a supported language with no assigned voice—the assistant answers in the default language and notifies the user once per session that it cannot reply in that language.
 - **Cantonese & Malay voices**: The bundled local Kokoro TTS engine provides English and Mandarin voices (`af_heart`, `zf_xiaoxiao`) out of the box. To speak Cantonese or Malay instead of falling back to the default language, configure a TTS engine that provides voices for them and assign those voice names in `/admin`.
 
+## ElevenLabs Speech Provider
+
+In **`/admin` → AI Agent**, cascaded sessions can use the existing OpenAI-compatible speech services or ElevenLabs for both STT and TTS. The LLM remains on its separately configured provider. New sessions use the saved selection; active sessions keep their starting provider.
+
+- Enter the ElevenLabs API key only in the administrator form. The backend encrypts it separately and read responses show a masked preview containing only the final five characters. Leaving the field blank preserves the saved key; non-empty keys must contain more than five characters.
+- Defaults are `scribe_v3` for STT and `eleven_flash_v2_5` for low-latency TTS. These models remain editable. The configured account is responsible for model availability and usage charges.
+- Voice assignments are provider-specific. Discover available ElevenLabs voice IDs in `/admin`, or enter an ID manually when discovery is unavailable. Local voice names are never reused automatically as ElevenLabs IDs.
+- ElevenLabs sends speech and generated text to an external cloud service. Errors remain visible and do not silently fall back to the local provider. Rotate a key by entering a replacement in `/admin`; do not place credentials in source, `.env` examples, logs, or tickets.
+- Scribe supports Cantonese, but `eleven_flash_v2_5` does not list Cantonese in its model language list. Leave Cantonese without an ElevenLabs voice or choose a verified compatible model/voice before assigning it.
+
 ## Issues and Solutions
 
 ### Restart Local STT and TTS

@@ -2,6 +2,7 @@ export interface VoiceLanguage {
   code: string;
   name: string;
   voice: string;
+  elevenLabsVoice: string;
 }
 
 export interface LanguageCatalogItem {
@@ -10,11 +11,76 @@ export interface LanguageCatalogItem {
   script: string;
 }
 
+export interface VoiceOption {
+  id: string;
+  name: string;
+  language?: string;
+}
+
+export const ELEVENLABS_CATALOG_VOICES: VoiceOption[] = [
+  { id: "BrbEfHMQu0fyclQR7lfh", name: "Kevin Tu", language: "zh" },
+  {
+    id: "hpp4J3VqNfWAUOO0d1Us",
+    name: "Bella - Professional, Bright, Warm",
+    language: "en",
+  },
+];
+
+export const ELEVENLABS_MODEL_OPTIONS = [
+  { id: "eleven_v4", name: "Eleven v4" },
+  { id: "eleven_v4_turbo", name: "Eleven v4 Turbo" },
+  { id: "eleven_v3", name: "Eleven v3" },
+  { id: "eleven_v3_conversational", name: "Eleven v3 Conversational" },
+  { id: "eleven_multilingual_v2", name: "Eleven Multilingual v2" },
+  { id: "eleven_flash_v2_5", name: "Eleven Flash v2.5" },
+  { id: "eleven_turbo_v2_5", name: "Eleven Turbo v2.5" },
+  { id: "eleven_turbo_v2", name: "Eleven Turbo v2" },
+  { id: "eleven_flash_v2", name: "Eleven Flash v2" },
+];
+
 export interface VoiceLanguageSettings {
   languages: VoiceLanguage[];
   defaultLanguage: string;
   saved: boolean;
   catalog: LanguageCatalogItem[];
+}
+
+export function missingDefaultProviderVoice(
+  languages: VoiceLanguage[],
+  defaultLanguage: string,
+  speechProvider: "local" | "elevenlabs"
+): VoiceLanguage | undefined {
+  const defaultEntry = languages.find((language) => language.code === defaultLanguage);
+  if (!defaultEntry) {
+    return undefined;
+  }
+
+  const providerVoice =
+    speechProvider === "elevenlabs"
+      ? defaultEntry.elevenLabsVoice
+      : defaultEntry.voice;
+  return providerVoice?.trim() ? undefined : defaultEntry;
+}
+
+export function applyRecommendedElevenLabsVoices(
+  languages: VoiceLanguage[],
+  voiceOptions: VoiceOption[]
+): VoiceLanguage[] {
+  const recommended = new Map<string, VoiceOption>();
+  for (const option of voiceOptions) {
+    const language = option.language?.trim().toLowerCase();
+    if (language && !recommended.has(language)) {
+      recommended.set(language, option);
+    }
+  }
+
+  return languages.map((language) => {
+    if (language.elevenLabsVoice.trim() !== "") {
+      return language;
+    }
+    const voice = recommended.get(language.code.toLowerCase());
+    return voice ? { ...language, elevenLabsVoice: voice.id } : language;
+  });
 }
 
 const KOKORO_PREFIXES: Record<string, string[]> = {
@@ -79,7 +145,7 @@ export function addLanguage(
   if (!entry) {
     return languages;
   }
-  return [...languages, { code: entry.code, name: entry.name, voice: "" }];
+  return [...languages, { code: entry.code, name: entry.name, voice: "", elevenLabsVoice: "" }];
 }
 
 export function removeLanguage(

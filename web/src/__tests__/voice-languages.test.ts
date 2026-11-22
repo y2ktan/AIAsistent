@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   addLanguage,
+  applyRecommendedElevenLabsVoices,
   availableCatalogLanguages,
   canRemoveLanguage,
+  ELEVENLABS_CATALOG_VOICES,
+  ELEVENLABS_MODEL_OPTIONS,
   includeSavedOption,
+  missingDefaultProviderVoice,
   partitionVoicesByLanguage,
   removeLanguage,
   type LanguageCatalogItem,
@@ -66,5 +70,84 @@ describe("voice-languages helpers", () => {
       "custom-model",
     ]);
     expect(includeSavedOption(["af_heart"], "af_heart")).toEqual(["af_heart"]);
+  });
+
+  it("identifies a missing voice for the active provider's default language", () => {
+    const languages: VoiceLanguage[] = [
+      {
+        code: "en",
+        name: "English",
+        voice: "af_heart",
+        elevenLabsVoice: "",
+      },
+      {
+        code: "zh",
+        name: "Mandarin Chinese",
+        voice: "",
+        elevenLabsVoice: "voice-zh",
+      },
+    ];
+
+    expect(missingDefaultProviderVoice(languages, "en", "local")).toBeUndefined();
+    expect(missingDefaultProviderVoice(languages, "en", "elevenlabs")).toEqual(
+      languages[0]
+    );
+    expect(missingDefaultProviderVoice(languages, "zh", "elevenlabs")).toBeUndefined();
+  });
+
+  it("auto-assigns matching ElevenLabs voices without overwriting saved choices", () => {
+    const languages: VoiceLanguage[] = [
+      {
+        code: "en",
+        name: "English",
+        voice: "af_heart",
+        elevenLabsVoice: "",
+      },
+      {
+        code: "zh",
+        name: "Mandarin Chinese",
+        voice: "zf_xiaoxiao",
+        elevenLabsVoice: "saved-zh-voice",
+      },
+      {
+        code: "yue",
+        name: "Cantonese",
+        voice: "",
+        elevenLabsVoice: "",
+      },
+    ];
+
+    expect(
+      applyRecommendedElevenLabsVoices(languages, [
+        { id: "zh-default", name: "Kevin Tu", language: "zh" },
+        { id: "en-default", name: "Bella", language: "en" },
+      ])
+    ).toEqual([
+      { ...languages[0], elevenLabsVoice: "en-default" },
+      languages[1],
+      languages[2],
+    ]);
+  });
+
+  it("provides catalog defaults before an ElevenLabs key is saved", () => {
+    const assigned = applyRecommendedElevenLabsVoices(
+      [
+        { code: "en", name: "English", voice: "af_heart", elevenLabsVoice: "" },
+        { code: "zh", name: "Mandarin Chinese", voice: "", elevenLabsVoice: "" },
+        { code: "ms", name: "Malay", voice: "", elevenLabsVoice: "" },
+      ],
+      ELEVENLABS_CATALOG_VOICES
+    );
+
+    expect(assigned.find((language) => language.code === "en")?.elevenLabsVoice).toBe(
+      "hpp4J3VqNfWAUOO0d1Us"
+    );
+    expect(assigned.find((language) => language.code === "zh")?.elevenLabsVoice).toBe(
+      "BrbEfHMQu0fyclQR7lfh"
+    );
+    expect(assigned.find((language) => language.code === "ms")?.elevenLabsVoice).toBe("");
+    expect(ELEVENLABS_MODEL_OPTIONS.some((model) => model.id === "eleven_flash_v2_5")).toBe(
+      true
+    );
   });
 });

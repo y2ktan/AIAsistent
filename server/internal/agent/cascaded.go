@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"aegis-voice/server/internal/rtc"
 	"aegis-voice/server/internal/security"
 )
+
+var elevenLabsAPIBaseURL = "https://api.elevenlabs.io"
 
 type CascadedAdapter struct {
 	deps              Dependencies
@@ -48,8 +51,15 @@ func NewCascadedAdapter(deps Dependencies) *CascadedAdapter {
 }
 
 func (c *CascadedAdapter) voiceLanguages() VoiceLanguageSettings {
-	if len(c.deps.Config.VoiceLanguages.Languages) > 0 {
-		return c.deps.Config.VoiceLanguages
+	out := c.deps.Config.VoiceLanguages
+	if len(out.Languages) > 0 {
+		if c.deps.Config.SpeechProvider == "elevenlabs" {
+			out.Languages = append([]VoiceLanguage(nil), out.Languages...)
+			for i := range out.Languages {
+				out.Languages[i].Voice = out.Languages[i].ElevenLabsVoice
+			}
+		}
+		return out
 	}
 	return InitialVoiceLanguageSettings(c.deps.Config.TTSVoice)
 }
@@ -243,7 +253,7 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		return nil
 	}
 
-	reply = SanitizeAssistantOutput(reply, []string{cfg.APIKey})
+	reply = SanitizeAssistantOutput(reply, []string{cfg.APIKey, cfg.ElevenLabsAPIKey})
 	c.deps.Sink.SendEvent(rtc.NewTranscriptEvent("transcript.final", "assistant", reply))
 
 	voice, actualCode := GuardVoiceForReply(reply, langRes, vl)
@@ -253,10 +263,10 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 	c.mu.Unlock()
 
 	// 5. Streaming TTS
-	if cfg.TTSBaseURL != "" && reply != "" {
+	if (cfg.SpeechProvider == "elevenlabs" || cfg.TTSBaseURL != "") && reply != "" {
 		c.deps.Sink.SendEvent(rtc.NewStateEvent("speaking"))
 		c.setSpeaking(true)
-		err := c.synthesizeAndStream(turnCtx, reply, voice)
+		err := c.synthesizeAndStream(turnCtx, reply, voice, actualCode)
 		c.setSpeaking(false)
 		if err != nil && !errors.Is(err, context.Canceled) && turnCtx.Err() == nil {
 			c.deps.Sink.SendEvent(rtc.NewErrorEvent("Speech synthesis failed."))
@@ -270,6 +280,9 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 }
 
 func (c *CascadedAdapter) transcribe(ctx context.Context, audioData []byte) (string, string, error) {
+	if c.deps.Config.SpeechProvider == "elevenlabs" {
+		return c.transcribeElevenLabs(ctx, audioData)
+	}
 	baseURL := strings.TrimRight(c.deps.Config.STTBaseURL, "/")
 	if baseURL == "" {
 		baseURL = strings.TrimRight(c.deps.Config.LLMBaseURL, "/")
@@ -555,7 +568,65 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text, voice string) error {
+func (c *CascadedAdapter) transcribeElevenLabs(ctx context.Context, audioData []byte) (string, string, error) {
+	if c.deps.Config.ElevenLabsAPIKey == "" {
+		return "", "", errors.New("elevenlabs api key not configured")
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	model := c.deps.Config.ElevenLabsSTTModel
+	if model == "" {
+		model = "scribe_v3"
+	}
+	_ = mw.WriteField("model_id", model)
+	_ = mw.WriteField("tag_audio_events", "false")
+	for _, alias := range append([]string{c.deps.Config.AssistantName}, c.deps.Config.WakeAliases...) {
+		if strings.TrimSpace(alias) != "" {
+			_ = mw.WriteField("keyterms", alias)
+		}
+	}
+	filename := "audio.wav"
+	if bytes.HasPrefix(audioData, []byte("OggS")) {
+		filename = "audio.ogg"
+	}
+	fw, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		return "", "", err
+	}
+	_, _ = fw.Write(audioData)
+	_ = mw.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(elevenLabsAPIBaseURL, "/")+"/v1/speech-to-text", &buf)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("xi-api-key", c.deps.Config.ElevenLabsAPIKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("elevenlabs stt status %d", resp.StatusCode)
+	}
+	var out struct {
+		Text         string `json:"text"`
+		LanguageCode string `json:"language_code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&out); err != nil {
+		return "", "", err
+	}
+	return out.Text, out.LanguageCode, nil
+}
+
+func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text, voice string, languageCodes ...string) error {
+	languageCode := ""
+	if len(languageCodes) > 0 {
+		languageCode = languageCodes[0]
+	}
+	if c.deps.Config.SpeechProvider == "elevenlabs" {
+		return c.synthesizeElevenLabs(ctx, text, voice, languageCode)
+	}
 	baseURL := strings.TrimRight(c.deps.Config.TTSBaseURL, "/")
 	policy := security.SSRFPolicy{AllowPrivate: c.deps.Config.AllowPrivate}
 	if _, err := policy.ValidateHTTPURL(baseURL); err != nil {
@@ -653,6 +724,79 @@ func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text, voice s
 		}
 	}
 	return nil
+}
+
+func (c *CascadedAdapter) synthesizeElevenLabs(ctx context.Context, text, voice, languageCode string) error {
+	if c.deps.Config.ElevenLabsAPIKey == "" {
+		return errors.New("elevenlabs api key not configured")
+	}
+	if strings.TrimSpace(voice) == "" {
+		return errors.New("elevenlabs voice not configured")
+	}
+	model := c.deps.Config.ElevenLabsTTSModel
+	if model == "" {
+		model = "eleven_flash_v2_5"
+	}
+	payload, err := json.Marshal(map[string]any{
+		"text":          text,
+		"model_id":      model,
+		"language_code": languageCode,
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := strings.TrimRight(elevenLabsAPIBaseURL, "/") + "/v1/text-to-speech/" + url.PathEscape(voice) + "/stream?output_format=opus_48000_64"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("xi-api-key", c.deps.Config.ElevenLabsAPIKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("elevenlabs tts status %d", resp.StatusCode)
+	}
+	return c.streamOggOpus(ctx, bufio.NewReader(resp.Body))
+}
+
+func (c *CascadedAdapter) streamOggOpus(ctx context.Context, br *bufio.Reader) error {
+	magic, peekErr := br.Peek(4)
+	if peekErr != nil || string(magic) != "OggS" {
+		return errors.New("elevenlabs returned non-opus audio")
+	}
+	reader := NewOggPacketReader(br)
+	start := time.Now()
+	var sent time.Duration
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		pkt, err := reader.NextPacket()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		dur := OpusPacketDuration(pkt)
+		if err := c.deps.Sink.WriteAudioSample(pkt, dur); err != nil {
+			return err
+		}
+		sent += dur
+		if wait := sent - time.Since(start); wait > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+	}
 }
 
 // Keep rag import used cleanly
