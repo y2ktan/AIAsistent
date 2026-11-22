@@ -269,7 +269,13 @@ func (c *CascadedAdapter) ProcessTurn(ctx context.Context, audioData []byte) err
 		err := c.synthesizeAndStream(turnCtx, reply, voice, actualCode)
 		c.setSpeaking(false)
 		if err != nil && !errors.Is(err, context.Canceled) && turnCtx.Err() == nil {
-			c.deps.Sink.SendEvent(rtc.NewErrorEvent("Speech synthesis failed."))
+			message := "Speech synthesis failed."
+			var providerErr *elevenLabsTTSError
+			if errors.As(err, &providerErr) {
+				message = providerErr.userMessage()
+			}
+			c.deps.Sink.SendEvent(rtc.NewErrorEvent(message))
+			c.deps.Sink.SendEvent(rtc.NewStateEvent("listening"))
 			return err
 		}
 	}
@@ -727,6 +733,31 @@ func (c *CascadedAdapter) synthesizeAndStream(ctx context.Context, text, voice s
 	return nil
 }
 
+type elevenLabsTTSError struct {
+	statusCode int
+}
+
+func (e *elevenLabsTTSError) Error() string {
+	return fmt.Sprintf("elevenlabs tts status %d", e.statusCode)
+}
+
+func (e *elevenLabsTTSError) userMessage() string {
+	switch e.statusCode {
+	case http.StatusPaymentRequired:
+		return "ElevenLabs could not synthesize speech (HTTP 402). Check your subscription, credits, and access to the configured voice."
+	case http.StatusUnauthorized:
+		return "ElevenLabs could not synthesize speech (HTTP 401). Ask an administrator to check the API key and account access."
+	case http.StatusForbidden:
+		return "ElevenLabs denied speech synthesis (HTTP 403). Check account permissions and access to the configured voice."
+	case http.StatusNotFound:
+		return "ElevenLabs could not find the configured speech resource (HTTP 404). Ask an administrator to check the voice and model."
+	case http.StatusTooManyRequests:
+		return "ElevenLabs limited speech synthesis (HTTP 429). Check account limits and try again later."
+	default:
+		return fmt.Sprintf("ElevenLabs speech synthesis failed (HTTP %d).", e.statusCode)
+	}
+}
+
 func (c *CascadedAdapter) synthesizeElevenLabs(ctx context.Context, text, voice, languageCode string) error {
 	if c.deps.Config.ElevenLabsAPIKey == "" {
 		return errors.New("elevenlabs api key not configured")
@@ -738,75 +769,23 @@ func (c *CascadedAdapter) synthesizeElevenLabs(ctx context.Context, text, voice,
 	if model == "" {
 		model = "eleven_flash_v2_5"
 	}
-	voices := []string{voice}
-	for _, fallbackVoice := range c.elevenLabsFallbackVoices(languageCode, voice) {
-		voices = appendUniqueString(voices, fallbackVoice)
+	resp, err := c.requestElevenLabsTTS(ctx, text, voice, model, languageCode)
+	if err != nil {
+		return err
 	}
-
-	var lastStatus int
-	for _, candidateVoice := range voices {
-		resp, err := c.requestElevenLabsTTS(ctx, text, candidateVoice, model, languageCode)
+	if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) &&
+		strings.TrimSpace(languageCode) != "" {
+		_ = resp.Body.Close()
+		resp, err = c.requestElevenLabsTTS(ctx, text, voice, model, "")
 		if err != nil {
 			return err
 		}
-		lastStatus = resp.StatusCode
-		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) &&
-			strings.TrimSpace(languageCode) != "" {
-			_ = resp.Body.Close()
-			resp, err = c.requestElevenLabsTTS(ctx, text, candidateVoice, model, "")
-			if err != nil {
-				return err
-			}
-			lastStatus = resp.StatusCode
-		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			defer func() { _ = resp.Body.Close() }()
-			return c.streamOggOpus(ctx, bufio.NewReader(resp.Body))
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusPaymentRequired &&
-			resp.StatusCode != http.StatusForbidden &&
-			resp.StatusCode != http.StatusNotFound {
-			return fmt.Errorf("elevenlabs tts status %d", resp.StatusCode)
-		}
 	}
-	return fmt.Errorf("elevenlabs tts status %d", lastStatus)
-}
-
-func (c *CascadedAdapter) elevenLabsFallbackVoices(languageCode, failedVoice string) []string {
-	settings := c.deps.Config.VoiceLanguages
-	var fallbacks []string
-	if normalized := strings.ToLower(strings.TrimSpace(languageCode)); normalized != "" {
-		for _, lang := range settings.Languages {
-			if strings.EqualFold(strings.TrimSpace(lang.Code), normalized) {
-				continue
-			}
-			voice := strings.TrimSpace(lang.ElevenLabsVoice)
-			if voice != "" {
-				fallbacks = appendUniqueString(fallbacks, voice)
-			}
-		}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &elevenLabsTTSError{statusCode: resp.StatusCode}
 	}
-	for _, lang := range settings.Languages {
-		voice := strings.TrimSpace(lang.ElevenLabsVoice)
-		if voice != "" && voice != strings.TrimSpace(failedVoice) {
-			fallbacks = appendUniqueString(fallbacks, voice)
-		}
-	}
-	return fallbacks
-}
-
-func appendUniqueString(values []string, value string) []string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return values
-	}
-	for _, existing := range values {
-		if existing == value {
-			return values
-		}
-	}
-	return append(values, value)
+	return c.streamOggOpus(ctx, bufio.NewReader(resp.Body))
 }
 
 func (c *CascadedAdapter) requestElevenLabsTTS(
@@ -852,6 +831,9 @@ func (c *CascadedAdapter) streamOggOpus(ctx context.Context, br *bufio.Reader) e
 		}
 		pkt, err := reader.NextPacket()
 		if err == io.EOF {
+			if sent == 0 {
+				return errors.New("elevenlabs returned no opus audio packets")
+			}
 			return nil
 		}
 		if err != nil {

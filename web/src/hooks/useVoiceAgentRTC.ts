@@ -97,6 +97,7 @@ export function useVoiceAgentRTC() {
   const [citations, setCitations] = useState<CitationItem[]>([]);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [playbackErrorMsg, setPlaybackErrorMsg] = useState<string | null>(null);
   const [permissionPrompt, setPermissionPrompt] = useState<string | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -117,6 +118,24 @@ export function useVoiceAgentRTC() {
   const micStateRef = useRef(true);
   const spkStateRef = useRef(true);
   const camStateRef = useRef(false);
+
+  const playRemoteAudio = useCallback(() => {
+    const audio = remoteAudioRef.current;
+    const stream = audio?.srcObject;
+    if (!audio || !stream) return;
+    void audio.play().then(
+      () => {
+        if (audio.srcObject === stream) setPlaybackErrorMsg(null);
+      },
+      () => {
+        if (audio.srcObject === stream) {
+          setPlaybackErrorMsg(
+            "The browser could not play the reply audio. Turn the speaker off and on to retry playback."
+          );
+        }
+      }
+    );
+  }, []);
 
   const sendMediaToggle = useCallback(() => {
     const dc = dcRef.current;
@@ -232,6 +251,10 @@ export function useVoiceAgentRTC() {
     if (videoPreviewRef.current) {
       videoPreviewRef.current.srcObject = null;
     }
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject = null;
+    }
+    setPlaybackErrorMsg(null);
     if (audioCtxRef.current) {
       void audioCtxRef.current.close();
       audioCtxRef.current = null;
@@ -249,6 +272,7 @@ export function useVoiceAgentRTC() {
 
   const startCall = useCallback(async () => {
     setErrorMsg(null);
+    setPlaybackErrorMsg(null);
     setPermissionPrompt(null);
     setConnecting(true);
 
@@ -350,7 +374,7 @@ export function useVoiceAgentRTC() {
         if (remoteStream && remoteAudioRef.current) {
           remoteAudioRef.current.srcObject = remoteStream;
           remoteAudioRef.current.muted = !spkStateRef.current;
-          void remoteAudioRef.current.play().catch(() => {});
+          playRemoteAudio();
 
           if (audioCtxRef.current) {
             const spkSrc = audioCtxRef.current.createMediaStreamSource(remoteStream);
@@ -416,7 +440,7 @@ export function useVoiceAgentRTC() {
     } finally {
       setConnecting(false);
     }
-  }, [handleDataChannelMessage, sendMediaToggle, stopCall]);
+  }, [handleDataChannelMessage, playRemoteAudio, sendMediaToggle, stopCall]);
 
   const toggleMic = useCallback(() => {
     const next = !micStateRef.current;
@@ -437,9 +461,10 @@ export function useVoiceAgentRTC() {
     setSpeakerEnabled(next);
     if (remoteAudioRef.current) {
       remoteAudioRef.current.muted = !next;
+      if (next) playRemoteAudio();
     }
     sendMediaToggle();
-  }, [sendMediaToggle]);
+  }, [playRemoteAudio, sendMediaToggle]);
 
   const toggleCamera = useCallback(async () => {
     setPermissionPrompt(null);
@@ -556,7 +581,7 @@ export function useVoiceAgentRTC() {
     transcripts,
     citations,
     activeTool,
-    errorMsg,
+    errorMsg: errorMsg || playbackErrorMsg,
     permissionPrompt,
     videoPreviewRef,
     remoteAudioRef,

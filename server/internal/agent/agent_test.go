@@ -322,51 +322,104 @@ func TestElevenLabsTTSRetriesWithoutLanguageCode(t *testing.T) {
 	}
 }
 
-func TestElevenLabsTTSFallsBackFromUnavailableVoice(t *testing.T) {
-	requestedVoices := []string{}
-	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		voice := strings.TrimPrefix(r.URL.Path, "/v1/text-to-speech/")
-		voice = strings.TrimSuffix(voice, "/stream")
-		requestedVoices = append(requestedVoices, voice)
-		if voice == "blocked-zh" {
-			w.WriteHeader(http.StatusPaymentRequired)
-			return
-		}
+func TestElevenLabsTurnSpeechOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		headersOnly bool
+		wantMessage string
+	}{
+		{name: "payment", status: http.StatusPaymentRequired, wantMessage: "subscription, credits"},
+		{name: "permission", status: http.StatusForbidden, wantMessage: "account permissions"},
+		{name: "missing voice", status: http.StatusNotFound, wantMessage: "voice and model"},
+		{name: "rate limit", status: http.StatusTooManyRequests, wantMessage: "account limits"},
+		{name: "no audio", status: http.StatusOK, headersOnly: true, wantMessage: "Speech synthesis failed."},
+		{name: "success", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requestedVoices []string
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/speech-to-text":
+					_, _ = w.Write([]byte(`{"text":"Aegis, what time is it?","language_code":"zho"}`))
+				case "/chat/completions":
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"现在是下午。"}}]}`))
+				default:
+					voice := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/text-to-speech/"), "/stream")
+					requestedVoices = append(requestedVoices, voice)
+					w.WriteHeader(tc.status)
+					if tc.status != http.StatusOK {
+						_, _ = w.Write([]byte(`{"detail":"private-provider-details"}`))
+						return
+					}
+					var stream bytes.Buffer
+					const serial = 0x12345680
+					writeOggPage(&stream, 0x02, 0, serial, 0, []byte("OpusHead\x01\x01\x38\x01\x80\xbb\x00\x00\x00\x00\x00"))
+					writeOggPage(&stream, 0x00, 0, serial, 1, []byte("OpusTags\x04\x00\x00\x00test\x00\x00\x00\x00"))
+					if !tc.headersOnly {
+						stream.Write(buildTestOggPage(0x04, 480, serial, 2, []byte{4}, []byte{27 << 3, 1, 2, 3}))
+					}
+					_, _ = w.Write(stream.Bytes())
+				}
+			}))
+			defer provider.Close()
 
-		var stream bytes.Buffer
-		const serial = 0x12345680
-		writeOggPage(&stream, 0x02, 0, serial, 0, []byte("OpusHead\x01\x01\x38\x01\x80\xbb\x00\x00\x00\x00\x00"))
-		writeOggPage(&stream, 0x00, 0, serial, 1, []byte("OpusTags\x04\x00\x00\x00test\x00\x00\x00\x00"))
-		stream.Write(buildTestOggPage(0x04, 480, serial, 2, []byte{4}, []byte{27 << 3, 1, 2, 3}))
-		_, _ = w.Write(stream.Bytes())
-	}))
-	defer provider.Close()
+			oldBase := elevenLabsAPIBaseURL
+			elevenLabsAPIBaseURL = provider.URL
+			defer func() { elevenLabsAPIBaseURL = oldBase }()
 
-	oldBase := elevenLabsAPIBaseURL
-	elevenLabsAPIBaseURL = provider.URL
-	t.Cleanup(func() { elevenLabsAPIBaseURL = oldBase })
-
-	adapter := NewCascadedAdapter(Dependencies{
-		Config: AgentConfig{
-			SpeechProvider:     "elevenlabs",
-			ElevenLabsAPIKey:   "eleven-test-key",
-			ElevenLabsTTSModel: "eleven_flash_v2_5",
-			AllowPrivate:       true,
-			VoiceLanguages: VoiceLanguageSettings{
-				DefaultCode: "zh",
-				Languages: []VoiceLanguage{
-					{Code: "en", Name: "English", ElevenLabsVoice: "available-en"},
-					{Code: "zh", Name: "Mandarin Chinese", ElevenLabsVoice: "blocked-zh"},
+			sink := &mockSink{}
+			adapter := NewCascadedAdapter(Dependencies{
+				Config: AgentConfig{
+					LLMBaseURL:       provider.URL,
+					SpeechProvider:   "elevenlabs",
+					ElevenLabsAPIKey: "eleven-test-key",
+					AllowPrivate:     true,
+					VoiceLanguages: VoiceLanguageSettings{
+						DefaultCode: "zh",
+						Languages: []VoiceLanguage{
+							{Code: "en", Name: "English", ElevenLabsVoice: "available-en"},
+							{Code: "zh", Name: "Mandarin Chinese", ElevenLabsVoice: "configured-zh"},
+						},
+					},
 				},
-			},
-		},
-		Sink: &mockSink{},
-	})
-	if err := adapter.synthesizeElevenLabs(context.Background(), "你好", "blocked-zh", "zh"); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(requestedVoices, []string{"blocked-zh", "available-en"}) {
-		t.Fatalf("requested voices = %#v", requestedVoices)
+				Sink: sink,
+			})
+			defer adapter.Close()
+			err := adapter.ProcessTurn(context.Background(), []byte("fake-ogg"))
+			if (err != nil) != (tc.wantMessage != "") {
+				t.Fatalf("ProcessTurn error = %v, want failure = %v", err, tc.wantMessage != "")
+			}
+			if err != nil && strings.Contains(err.Error(), "private-provider-details") {
+				t.Fatal("provider details leaked into returned error")
+			}
+			if !reflect.DeepEqual(requestedVoices, []string{"configured-zh"}) {
+				t.Fatalf("requested voices = %#v, want only the configured Mandarin voice", requestedVoices)
+			}
+			if adapter.IsSpeaking() || adapter.hasActiveTurn() {
+				t.Fatal("speech failure or completion left the turn active")
+			}
+			last := sink.events[len(sink.events)-1]
+			if last.Type != "state" || last.State != "listening" {
+				t.Fatalf("last event = %#v, want listening", last)
+			}
+			var errorMessage string
+			for _, event := range sink.events {
+				if event.Type == "error" {
+					errorMessage = event.Message
+				}
+			}
+			if tc.wantMessage != "" {
+				if !strings.Contains(errorMessage, tc.wantMessage) || strings.Contains(errorMessage, "private-provider-details") {
+					t.Fatalf("unexpected error message: %q", errorMessage)
+				}
+				if len(sink.audio) != 0 {
+					t.Fatal("failed synthesis should not send audio")
+				}
+			} else if errorMessage != "" || len(sink.audio) != 1 {
+				t.Fatalf("successful synthesis: error = %q, audio samples = %d", errorMessage, len(sink.audio))
+			}
+		})
 	}
 }
 

@@ -108,6 +108,8 @@ In **`/admin` → AI Agent**, cascaded sessions can use the existing OpenAI-comp
 - Defaults are `scribe_v3` for STT and `eleven_flash_v2_5` for low-latency TTS. These models remain editable. The configured account is responsible for model availability and usage charges.
 - Voice assignments are provider-specific. Discover available ElevenLabs voice IDs in `/admin`, or enter an ID manually when discovery is unavailable. Local voice names are never reused automatically as ElevenLabs IDs.
 - ElevenLabs sends speech and generated text to an external cloud service. Errors remain visible and do not silently fall back to the local provider. Rotate a key by entering a replacement in `/admin`; do not place credentials in source, `.env` examples, logs, or tickets.
+- Failed synthesis returns the call to listening and preserves the text reply. Payment/access failures do not retry other voices: HTTP 402 prompts you to check subscription, credits, and configured-voice access, but does not by itself prove a subscription problem. An audio response containing no speech packets is also reported as a failure.
+- If the browser rejects reply-audio playback, the call shows a playback error instead of hiding it. Turn the speaker off and on to retry playback.
 - Scribe supports Cantonese, but `eleven_flash_v2_5` does not list Cantonese in its model language list. Leave Cantonese without an ElevenLabs voice or choose a verified compatible model/voice before assigning it.
 
 ## Issues and Solutions

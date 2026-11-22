@@ -292,4 +292,50 @@ describe("home-page citation rendering", () => {
 
     expect(container.querySelector('[data-testid="probe-name"]')?.textContent).toBe("Jarvis");
   });
+
+  it("shows rejected audio playback and allows a speaker-toggle retry", async () => {
+    const actualHookModule = await vi.importActual<typeof import("@/hooks/useVoiceAgentRTC")>(
+      "@/hooks/useVoiceAgentRTC"
+    );
+    vi.mocked(apiFetch).mockResolvedValue({ assistantName: "Aegis" });
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play")
+      .mockRejectedValueOnce(new DOMException("Playback blocked", "NotAllowedError"))
+      .mockResolvedValue(undefined);
+
+    function Probe() {
+      const { remoteAudioRef, toggleSpeaker, errorMsg } = actualHookModule.useVoiceAgentRTC();
+      return createElement("div", null,
+        createElement("audio", { ref: remoteAudioRef }),
+        createElement("button", { onClick: toggleSpeaker }, "Toggle speaker"),
+        createElement("div", { "data-testid": "playback-error" }, errorMsg)
+      );
+    }
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    try {
+      await act(async () => root.render(createElement(Probe)));
+      Object.defineProperty(container.querySelector("audio"), "srcObject", {
+        value: { id: "remote-stream" },
+        writable: true,
+      });
+      const button = container.querySelector("button")!;
+      await act(async () => {
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      expect(play).toHaveBeenCalledTimes(1);
+      expect(container.querySelector('[data-testid="playback-error"]')?.textContent)
+        .toContain("browser could not play");
+      await act(async () => {
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      expect(play).toHaveBeenCalledTimes(2);
+      expect(container.querySelector('[data-testid="playback-error"]')?.textContent).toBe("");
+    } finally {
+      play.mockRestore();
+    }
+  });
 });
