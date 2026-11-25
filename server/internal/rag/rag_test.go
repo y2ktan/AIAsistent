@@ -52,7 +52,7 @@ func (m *memRAGStore) UpdateDocumentStatus(_ context.Context, docID, status, err
 	return nil
 }
 
-func (m *memRAGStore) ReplaceDocumentChunks(_ context.Context, docID string, chunks []DocumentChunk) error {
+func (m *memRAGStore) ReplaceDocumentChunks(_ context.Context, docID string, chunks []DocumentChunk, extractedText string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, ok := m.docs[docID]
@@ -63,6 +63,9 @@ func (m *memRAGStore) ReplaceDocumentChunks(_ context.Context, docID string, chu
 	d.Status = "ready"
 	d.ErrorMessage = ""
 	d.ChunkCount = len(chunks)
+	d.ExtractedText = extractedText
+	d.ElevenLabsSyncStatus = "not_synced"
+	d.ElevenLabsSyncError = ""
 	return nil
 }
 
@@ -96,6 +99,41 @@ func (m *memRAGStore) ListDocuments(_ context.Context) ([]Document, error) {
 		out = append(out, *d)
 	}
 	return out, nil
+}
+
+func (m *memRAGStore) ListReadyDocumentsForHostedSync(_ context.Context) ([]Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Document
+	for id, d := range m.docs {
+		if d.Status != "ready" {
+			continue
+		}
+		cp := *d
+		if cp.ExtractedText == "" {
+			cp.ExtractedText = reconstructTextFromChunks(m.chunks[id])
+		}
+		out = append(out, cp)
+	}
+	return out, nil
+}
+
+func (m *memRAGStore) UpdateElevenLabsSyncState(
+	_ context.Context,
+	docID, elevenLabsDocID, syncedHash, agentID, status, errMsg string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.docs[docID]
+	if !ok {
+		return ErrNotFound
+	}
+	d.ElevenLabsDocID = elevenLabsDocID
+	d.ElevenLabsSyncedHash = syncedHash
+	d.ElevenLabsAgentID = agentID
+	d.ElevenLabsSyncStatus = status
+	d.ElevenLabsSyncError = errMsg
+	return nil
 }
 
 func cosineSim(a, b []float32) float64 {
@@ -213,7 +251,6 @@ func TestExtractionAndChunking(t *testing.T) {
 	if err != nil || !strings.Contains(txt, "Pion WebRTC") {
 		t.Fatalf("DOCX extraction failed: %q err=%v", txt, err)
 	}
-
 	pdf := []byte("%PDF-1.4\n1 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 712 Td (Pion WebRTC Guide) Tj ET\nendstream\nendobj")
 	ptxt, err := ExtractText(DocTypePDF, pdf)
 	if err != nil || !strings.Contains(ptxt, "Pion WebRTC Guide") {
@@ -227,6 +264,29 @@ func TestExtractionAndChunking(t *testing.T) {
 	}
 }
 
+func TestReconstructTextFromChunksTrimsOverlapInChunkOrder(t *testing.T) {
+	overlap := strings.Repeat("x", 360)
+	chunks := []DocumentChunk{
+		{ChunkIndex: 1, Content: overlap + "second"},
+		{ChunkIndex: 0, Content: "first" + overlap},
+	}
+
+	if got, want := reconstructTextFromChunks(chunks), "first"+overlap+"second"; got != want {
+		t.Fatalf("reconstructed text mismatch:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+func TestReconstructTextFromChunksSeparatesNonOverlappingChunks(t *testing.T) {
+	chunks := []DocumentChunk{
+		{ChunkIndex: 0, Content: "first"},
+		{ChunkIndex: 1, Content: "second"},
+	}
+
+	if got, want := reconstructTextFromChunks(chunks), "first\n\nsecond"; got != want {
+		t.Fatalf("reconstructed text mismatch: got %q, want %q", got, want)
+	}
+}
+
 func TestIngestRetrieveAndDelete(t *testing.T) {
 	store := newMemRAGStore()
 	svc := NewService(store, DefaultMaxUploadBytes)
@@ -235,6 +295,9 @@ func TestIngestRetrieveAndDelete(t *testing.T) {
 	doc, err := svc.Ingest(context.Background(), "Pion Architecture", "pion.md", []byte("# Pion\nWe use Pion WebRTC for media."), "admin-1", emb)
 	if err != nil || doc.Status != "ready" {
 		t.Fatalf("expected ready document, got doc=%+v err=%v", doc, err)
+	}
+	if stored, err := store.GetDocument(context.Background(), doc.ID); err != nil || stored.ExtractedText != "# Pion\nWe use Pion WebRTC for media." {
+		t.Fatalf("expected extracted text to be stored, got doc=%+v err=%v", stored, err)
 	}
 
 	// Retrieve matching query

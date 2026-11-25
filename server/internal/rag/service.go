@@ -54,6 +54,14 @@ func (s *Service) Ingest(ctx context.Context, title, filename string, data []byt
 }
 
 func (s *Service) ReindexWithText(ctx context.Context, docID string, embedder Embedder, chunksText []string) error {
+	chunks := make([]DocumentChunk, len(chunksText))
+	for i, text := range chunksText {
+		chunks[i] = DocumentChunk{ChunkIndex: i, Content: text}
+	}
+	return s.reindexWithText(ctx, docID, embedder, chunksText, reconstructTextFromChunks(chunks))
+}
+
+func (s *Service) reindexWithText(ctx context.Context, docID string, embedder Embedder, chunksText []string, extractedText string) error {
 	if embedder == nil {
 		_ = s.store.UpdateDocumentStatus(ctx, docID, "failed", "embedding provider not configured", 0)
 		return errors.New("embedding provider not configured")
@@ -73,7 +81,23 @@ func (s *Service) ReindexWithText(ctx context.Context, docID string, embedder Em
 			Embedding:  vecs[i],
 		})
 	}
-	return s.store.ReplaceDocumentChunks(ctx, docID, dbChunks)
+	return s.store.ReplaceDocumentChunks(ctx, docID, dbChunks, extractedText)
+}
+
+func (s *Service) Reindex(ctx context.Context, docID string, embedder Embedder) error {
+	doc, err := s.store.GetDocument(ctx, docID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(doc.ExtractedText) == "" {
+		return ErrExtractionFailed
+	}
+	chunks := ChunkText(doc.ExtractedText, 2400, 360)
+	texts := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		texts[i] = chunk.Content
+	}
+	return s.reindexWithText(ctx, docID, embedder, texts, doc.ExtractedText)
 }
 
 func (s *Service) indexDocumentData(ctx context.Context, doc *Document, docType DocType, data []byte, embedder Embedder) error {
@@ -113,7 +137,7 @@ func (s *Service) indexDocumentData(ctx context.Context, doc *Document, docType 
 			Embedding:  vecs[i],
 		}
 	}
-	return s.store.ReplaceDocumentChunks(ctx, doc.ID, dbChunks)
+	return s.store.ReplaceDocumentChunks(ctx, doc.ID, dbChunks, text)
 }
 
 func (s *Service) Delete(ctx context.Context, docID string) error {
@@ -122,6 +146,21 @@ func (s *Service) Delete(ctx context.Context, docID string) error {
 
 func (s *Service) List(ctx context.Context) ([]Document, error) {
 	return s.store.ListDocuments(ctx)
+}
+
+func (s *Service) GetDocument(ctx context.Context, docID string) (*Document, error) {
+	return s.store.GetDocument(ctx, docID)
+}
+
+func (s *Service) ListReadyDocumentsForHostedSync(ctx context.Context) ([]Document, error) {
+	return s.store.ListReadyDocumentsForHostedSync(ctx)
+}
+
+func (s *Service) UpdateElevenLabsSyncState(
+	ctx context.Context,
+	docID, elevenLabsDocID, syncedHash, agentID, status, errMsg string,
+) error {
+	return s.store.UpdateElevenLabsSyncState(ctx, docID, elevenLabsDocID, syncedHash, agentID, status, errMsg)
 }
 
 func (s *Service) Retrieve(ctx context.Context, query string, topK int, minSimilarity float64, embedder Embedder) ([]RetrievedChunk, error) {

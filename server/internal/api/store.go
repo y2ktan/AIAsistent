@@ -17,50 +17,62 @@ var (
 )
 
 type AgentConfigRecord struct {
-	ID                         string    `json:"id"`
-	Name                       string    `json:"name"`
-	Mode                       string    `json:"mode"`
-	RealtimeWSURL              string    `json:"realtimeWsUrl"`
-	RealtimeModel              string    `json:"realtimeModel"`
-	STTBaseURL                 string    `json:"sttBaseUrl"`
-	STTModel                   string    `json:"sttModel"`
-	LLMBaseURL                 string    `json:"llmBaseUrl"`
-	LLMModel                   string    `json:"llmModel"`
-	TTSBaseURL                 string    `json:"ttsBaseUrl"`
-	TTSModel                   string    `json:"ttsModel"`
-	TTSVoice                   string    `json:"ttsVoice"`
-	EmbeddingBaseURL           string    `json:"embeddingBaseUrl"`
-	EmbeddingModel             string    `json:"embeddingModel"`
-	EmbeddingDim               int       `json:"embeddingDim"`
-	SystemInstructions         string    `json:"systemInstructions"`
-	APIKeyCiphertext           []byte    `json:"-"`
-	APIKeyLast4                string    `json:"apiKeyPreview"`
-	RAGTopK                    int       `json:"ragTopK"`
-	RAGMinSimilarity           float64   `json:"ragMinSimilarity"`
-	AudioFocusEnabled          bool      `json:"audioFocusEnabled"`
-	AssistantName              string    `json:"assistantName"`
-	WakeAliases                []string  `json:"wakeAliases"`
-	SpeechProvider             string    `json:"speechProvider"`
-	ElevenLabsSTTModel         string    `json:"elevenLabsSttModel"`
-	ElevenLabsTTSModel         string    `json:"elevenLabsTtsModel"`
-	ElevenLabsAPIKeyCiphertext []byte    `json:"-"`
-	ElevenLabsAPIKeyLast5      string    `json:"elevenLabsApiKeyPreview"`
-	UpdatedAt                  time.Time `json:"updatedAt"`
+	ID                          string    `json:"id"`
+	Name                        string    `json:"name"`
+	Mode                        string    `json:"mode"`
+	RealtimeWSURL               string    `json:"realtimeWsUrl"`
+	RealtimeModel               string    `json:"realtimeModel"`
+	STTBaseURL                  string    `json:"sttBaseUrl"`
+	STTModel                    string    `json:"sttModel"`
+	LLMBaseURL                  string    `json:"llmBaseUrl"`
+	LLMModel                    string    `json:"llmModel"`
+	TTSBaseURL                  string    `json:"ttsBaseUrl"`
+	TTSModel                    string    `json:"ttsModel"`
+	TTSVoice                    string    `json:"ttsVoice"`
+	EmbeddingBaseURL            string    `json:"embeddingBaseUrl"`
+	EmbeddingModel              string    `json:"embeddingModel"`
+	EmbeddingDim                int       `json:"embeddingDim"`
+	SystemInstructions          string    `json:"systemInstructions"`
+	APIKeyCiphertext            []byte    `json:"-"`
+	APIKeyLast4                 string    `json:"apiKeyPreview"`
+	RAGTopK                     int       `json:"ragTopK"`
+	RAGMinSimilarity            float64   `json:"ragMinSimilarity"`
+	AudioFocusEnabled           bool      `json:"audioFocusEnabled"`
+	AssistantName               string    `json:"assistantName"`
+	WakeAliases                 []string  `json:"wakeAliases"`
+	SpeechProvider              string    `json:"speechProvider"`
+	ElevenLabsSTTModel          string    `json:"elevenLabsSttModel"`
+	ElevenLabsTTSModel          string    `json:"elevenLabsTtsModel"`
+	ElevenLabsAPIKeyCiphertext  []byte    `json:"-"`
+	ElevenLabsAPIKeyLast5       string    `json:"elevenLabsApiKeyPreview"`
+	ElevenLabsAgentID           string    `json:"elevenLabsAgentId"`
+	ElevenLabsRAGSyncEnabled    bool      `json:"elevenLabsRagSyncEnabled"`
+	ElevenLabsSkillsSyncEnabled bool      `json:"elevenLabsAgentSkillsSyncEnabled"`
+	UpdatedAt                   time.Time `json:"updatedAt"`
 }
 
 type MCPServerRecord struct {
-	ID                   string        `json:"id"`
-	Name                 string        `json:"name"`
-	Transport            string        `json:"transport"`
-	EndpointURL          string        `json:"endpointUrl"`
-	AuthHeaderCiphertext []byte        `json:"-"`
-	AuthHeaderLast4      string        `json:"authHeaderPreview"`
-	Enabled              bool          `json:"enabled"`
-	AllowedTools         []string      `json:"allowedTools"`
-	DiscoveredTools      []mcp.ToolDef `json:"discoveredTools"`
-	TimeoutMs            int           `json:"timeoutMs"`
-	CreatedAt            time.Time     `json:"createdAt"`
-	UpdatedAt            time.Time     `json:"updatedAt"`
+	ID                      string        `json:"id"`
+	Name                    string        `json:"name"`
+	Transport               string        `json:"transport"`
+	EndpointURL             string        `json:"endpointUrl"`
+	AuthHeaderCiphertext    []byte        `json:"-"`
+	AuthHeaderLast4         string        `json:"authHeaderPreview"`
+	Enabled                 bool          `json:"enabled"`
+	AllowedTools            []string      `json:"allowedTools"`
+	DiscoveredTools         []mcp.ToolDef `json:"discoveredTools"`
+	TimeoutMs               int           `json:"timeoutMs"`
+	HostedMode              string        `json:"hostedMode"`
+	HostedResourceID        string        `json:"hostedResourceId"`
+	HostedAgentID           string        `json:"hostedAgentId"`
+	HostedSyncStatus        string        `json:"hostedSyncStatus"`
+	HostedSyncError         string        `json:"hostedSyncError"`
+	HostedProxyCredential   []byte        `json:"-"`
+	HostedCreationIntentID  string        `json:"-"`
+	HostedCreationConfig    []byte        `json:"-"`
+	HostedCreationAttempted bool          `json:"-"`
+	CreatedAt               time.Time     `json:"createdAt"`
+	UpdatedAt               time.Time     `json:"updatedAt"`
 }
 
 type AuditLogRecord struct {
@@ -88,6 +100,7 @@ type AdminStore interface {
 	GetMCPServer(ctx context.Context, id string) (*MCPServerRecord, error)
 	UpsertMCPServer(ctx context.Context, rec *MCPServerRecord) (*MCPServerRecord, error)
 	DeleteMCPServer(ctx context.Context, id string) error
+	WithHostedMCPLock(ctx context.Context, fn func(AdminStore) error) error
 	ListAgentSkills(ctx context.Context) ([]skills.Skill, error)
 	GetAgentSkill(ctx context.Context, id string) (*skills.Skill, error)
 	UpsertAgentSkillByName(ctx context.Context, skill *skills.Skill) (*skills.Skill, error)

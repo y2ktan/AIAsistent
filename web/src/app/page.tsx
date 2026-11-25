@@ -24,11 +24,16 @@ import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
 import {
   filterVisibleCitations,
   normalizeAssistantName,
-  useVoiceAgentRTC,
+  type useVoiceAgentRTC,
 } from "@/hooks/useVoiceAgentRTC";
 import { LiquidPlasmaOrb } from "@/components/LiquidPlasmaOrb";
+import { VoiceSessionRouter } from "@/components/VoiceSessionRouter";
 
 export default function HomePage() {
+  return <VoiceSessionRouter>{(voice, hosted) => <VoiceHome voice={voice} hosted={hosted} />}</VoiceSessionRouter>;
+}
+
+function VoiceHome({ voice, hosted }: { voice: ReturnType<typeof useVoiceAgentRTC>; hosted: boolean }) {
   const router = useRouter();
   const [user, setUser] = useState<AuthUser | null>(null);
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
@@ -54,7 +59,7 @@ export default function HomePage() {
     toggleSpeaker,
     toggleCamera,
     getAudioEnergy,
-  } = useVoiceAgentRTC();
+  } = voice;
 
   useEffect(() => {
     fetchSession().then((res) => {
@@ -65,6 +70,10 @@ export default function HomePage() {
       setUser(res.user);
     });
   }, [router]);
+
+  useEffect(() => {
+    if (hosted) setExpandedCitation(null);
+  }, [hosted]);
 
   async function handleLogout() {
     stopCall();
@@ -128,6 +137,15 @@ export default function HomePage() {
       {/* Center Stage: Liquid Plasma Orb + Kinetic Captions + Citations */}
       <section className="relative z-10 flex flex-1 flex-col items-center justify-center px-4 pb-28">
         <LiquidPlasmaOrb state={agentState} getAudioEnergy={getAudioEnergy} />
+        {hosted && (
+          <p className="mt-4 max-w-lg text-center text-xs text-slate-400">
+            Assistant Name, System Instructions, enabled Agent Skills, and ready local documents are
+            synchronized server-side. ElevenLabs processes audio and knowledge in the cloud and owns
+            the model, voice, languages, retention, turn-taking, interruption, and noise handling.
+            Usage may incur charges. Local wake/question/pause rules and Audio Focus do not apply.
+            Camera, local citations, and runtime MCP tools are unavailable.
+          </p>
+        )}
 
         {(permissionPrompt || errorMsg) && (
           <div
@@ -222,9 +240,9 @@ export default function HomePage() {
       <div className="fixed bottom-6 left-1/2 z-20 -translate-x-1/2">
         <div className="flex items-center gap-3 rounded-full border border-slate-700/50 bg-slate-900/70 px-5 py-3 shadow-2xl backdrop-blur-2xl">
           <button
-            onClick={connected ? stopCall : startCall}
-            disabled={connecting}
-            aria-label={connected ? "End Voice Session" : "Start Voice Session"}
+            onClick={connected || connecting ? stopCall : startCall}
+            disabled={!hosted && connecting}
+            aria-label={connected || connecting ? "End Voice Session" : "Start Voice Session"}
             className={`flex h-12 w-12 items-center justify-center rounded-full transition ${
               connected
                 ? "bg-rose-600 text-white shadow-lg shadow-rose-600/30 hover:bg-rose-500"
@@ -236,6 +254,7 @@ export default function HomePage() {
 
           <button
             onClick={toggleMic}
+            disabled={hosted && connecting}
             aria-label={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
             className={`flex h-11 w-11 items-center justify-center rounded-full border transition ${
               micEnabled
@@ -248,6 +267,7 @@ export default function HomePage() {
 
           <button
             onClick={toggleSpeaker}
+            disabled={hosted && connecting}
             aria-label={speakerEnabled ? "Mute Speaker" : "Unmute Speaker"}
             className={`flex h-11 w-11 items-center justify-center rounded-full border transition ${
               speakerEnabled
@@ -264,7 +284,7 @@ export default function HomePage() {
 
           <button
             onClick={toggleCamera}
-            disabled={!connected}
+            disabled={!connected || hosted}
             aria-label={cameraEnabled ? "Disable Camera" : "Enable Camera"}
             className={`flex h-11 w-11 items-center justify-center rounded-full border transition disabled:opacity-40 ${
               cameraEnabled

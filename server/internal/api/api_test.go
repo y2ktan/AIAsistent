@@ -21,11 +21,13 @@ import (
 	"aegis-voice/server/internal/security"
 	"aegis-voice/server/internal/skills"
 
+	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
 )
 
 type mockAllStore struct {
 	mu              sync.Mutex
+	hostedMCPMu     sync.Mutex
 	users           map[string]*auth.User
 	sessions        map[string]*auth.Session
 	signalingTokens map[string]*auth.SignalingToken
@@ -34,6 +36,7 @@ type mockAllStore struct {
 	mcpServers      map[string]*MCPServerRecord
 	agentSkills     map[string]*skills.Skill
 	audits          []AuditLogRecord
+	ragStore        *mockRAGStore
 	seq             int
 }
 
@@ -44,8 +47,136 @@ func newMockAllStore() *mockAllStore {
 		signalingTokens: make(map[string]*auth.SignalingToken),
 		mcpServers:      make(map[string]*MCPServerRecord),
 		agentSkills:     make(map[string]*skills.Skill),
-		agentCfg:        &AgentConfigRecord{Name: "default", Mode: "cascaded", AudioFocusEnabled: true, AssistantName: "Aegis", WakeAliases: []string{}},
+		ragStore:        newMockRAGStore(),
+		agentCfg: &AgentConfigRecord{
+			Name: "default", Mode: "cascaded", AudioFocusEnabled: true, AssistantName: "Aegis", WakeAliases: []string{},
+			ElevenLabsRAGSyncEnabled: true, ElevenLabsSkillsSyncEnabled: true,
+		},
 	}
+}
+
+type mockRAGStore struct {
+	mu     sync.Mutex
+	docs   map[string]*rag.Document
+	chunks map[string][]rag.DocumentChunk
+	seq    int
+}
+
+func newMockRAGStore() *mockRAGStore {
+	return &mockRAGStore{docs: make(map[string]*rag.Document), chunks: make(map[string][]rag.DocumentChunk)}
+}
+
+func (m *mockRAGStore) CreateDocument(_ context.Context, doc *rag.Document) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq++
+	doc.ID = "doc-" + string(rune('0'+m.seq))
+	doc.CreatedAt = time.Now()
+	doc.UpdatedAt = doc.CreatedAt
+	cp := *doc
+	m.docs[doc.ID] = &cp
+	return nil
+}
+
+func (m *mockRAGStore) UpdateDocumentStatus(_ context.Context, id, status, message string, chunks int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	doc, ok := m.docs[id]
+	if !ok {
+		return rag.ErrNotFound
+	}
+	doc.Status, doc.ErrorMessage, doc.ChunkCount = status, message, chunks
+	return nil
+}
+
+func (m *mockRAGStore) ReplaceDocumentChunks(_ context.Context, id string, chunks []rag.DocumentChunk, text string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	doc, ok := m.docs[id]
+	if !ok {
+		return rag.ErrNotFound
+	}
+	m.chunks[id] = append([]rag.DocumentChunk(nil), chunks...)
+	doc.Status, doc.ErrorMessage, doc.ChunkCount = "ready", "", len(chunks)
+	doc.ExtractedText = text
+	doc.ElevenLabsSyncStatus = "not_synced"
+	doc.ElevenLabsSyncError = ""
+	return nil
+}
+
+func (m *mockRAGStore) DeleteDocument(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.docs[id]; !ok {
+		return rag.ErrNotFound
+	}
+	delete(m.docs, id)
+	delete(m.chunks, id)
+	return nil
+}
+
+func (m *mockRAGStore) GetDocument(_ context.Context, id string) (*rag.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	doc, ok := m.docs[id]
+	if !ok {
+		return nil, rag.ErrNotFound
+	}
+	cp := *doc
+	return &cp, nil
+}
+
+func (m *mockRAGStore) ListDocuments(_ context.Context) ([]rag.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]rag.Document, 0, len(m.docs))
+	for _, doc := range m.docs {
+		out = append(out, *doc)
+	}
+	return out, nil
+}
+
+func (m *mockRAGStore) ListReadyDocumentsForHostedSync(_ context.Context) ([]rag.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []rag.Document
+	for id, doc := range m.docs {
+		if doc.Status != "ready" {
+			continue
+		}
+		cp := *doc
+		if cp.ExtractedText == "" {
+			var chunks []string
+			for _, chunk := range m.chunks[id] {
+				chunks = append(chunks, chunk.Content)
+			}
+			cp.ExtractedText = strings.Join(chunks, "\n\n")
+		}
+		out = append(out, cp)
+	}
+	return out, nil
+}
+
+func (m *mockRAGStore) UpdateElevenLabsSyncState(
+	_ context.Context,
+	id, hostedID, contentHash, agentID, status, message string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	doc, ok := m.docs[id]
+	if !ok {
+		return rag.ErrNotFound
+	}
+	doc.ElevenLabsDocID = hostedID
+	doc.ElevenLabsSyncedHash = contentHash
+	doc.ElevenLabsAgentID = agentID
+	doc.ElevenLabsSyncStatus = status
+	doc.ElevenLabsSyncError = message
+	return nil
+}
+
+func (m *mockRAGStore) SearchSimilar(context.Context, []float32, int, float64) ([]rag.RetrievedChunk, error) {
+	return nil, nil
 }
 
 func (m *mockAllStore) CountUsers(_ context.Context) (int, error) {
@@ -237,14 +368,59 @@ func (m *mockAllStore) ReplaceVoiceLanguages(_ context.Context, cfg agent.VoiceL
 	return nil
 }
 
-func (m *mockAllStore) ListMCPServers(_ context.Context) ([]MCPServerRecord, error) { return nil, nil }
-func (m *mockAllStore) GetMCPServer(_ context.Context, _ string) (*MCPServerRecord, error) {
-	return nil, ErrNotFound
+func (m *mockAllStore) WithHostedMCPLock(_ context.Context, fn func(AdminStore) error) error {
+	m.hostedMCPMu.Lock()
+	defer m.hostedMCPMu.Unlock()
+	return fn(&lockedMockAdminStore{AdminStore: m})
+}
+
+type lockedMockAdminStore struct{ AdminStore }
+
+func (m *lockedMockAdminStore) WithHostedMCPLock(_ context.Context, fn func(AdminStore) error) error {
+	return fn(m)
+}
+func (m *mockAllStore) ListMCPServers(_ context.Context) ([]MCPServerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]MCPServerRecord, 0, len(m.mcpServers))
+	for _, rec := range m.mcpServers {
+		cp := *rec
+		normalizeHostedMCP(&cp)
+		out = append(out, cp)
+	}
+	return out, nil
+}
+func (m *mockAllStore) GetMCPServer(_ context.Context, id string) (*MCPServerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.mcpServers[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *rec
+	normalizeHostedMCP(&cp)
+	return &cp, nil
 }
 func (m *mockAllStore) UpsertMCPServer(_ context.Context, rec *MCPServerRecord) (*MCPServerRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	normalizeHostedMCP(rec)
+	if rec.ID == "" {
+		rec.ID = uuid.NewString()
+	}
+	cp := *rec
+	m.mcpServers[rec.ID] = &cp
 	return rec, nil
 }
-func (m *mockAllStore) DeleteMCPServer(_ context.Context, _ string) error { return nil }
+func (m *mockAllStore) DeleteMCPServer(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mcpServers[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.mcpServers, id)
+	return nil
+}
 func cloneTestSkill(skill *skills.Skill) *skills.Skill {
 	cp := *skill
 	cp.AllowedTools = append([]string(nil), skill.AllowedTools...)
@@ -657,7 +833,7 @@ func TestAdminAPISchemaRBACMaskingAndLastAdmin(t *testing.T) {
 	req.AddCookie(adminCookie)
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || rec.Body.String() != "{\"assistantName\":\"Aegis\",\"audioFocusEnabled\":false}\n" {
+	if rec.Code != http.StatusOK || rec.Body.String() != "{\"assistantName\":\"Aegis\",\"audioFocusEnabled\":false,\"capabilities\":{\"camera\":true,\"localKnowledge\":true,\"strictWakeGate\":true},\"mode\":\"cascaded\"}\n" {
 		t.Fatalf("expected authenticated rtc config with assistantName=Aegis and audioFocusEnabled=false, got %d: %s", rec.Code, rec.Body.String())
 	}
 
@@ -1120,7 +1296,7 @@ func TestAssistantWakeNameAdminAndRTCConfig(t *testing.T) {
 	if rtcRec.Code != http.StatusOK {
 		t.Fatalf("GET /api/v1/rtc/config failed: %d %s", rtcRec.Code, rtcRec.Body.String())
 	}
-	if rtcRec.Body.String() != "{\"assistantName\":\"Jarvis\",\"audioFocusEnabled\":true}\n" {
+	if rtcRec.Body.String() != "{\"assistantName\":\"Jarvis\",\"audioFocusEnabled\":true,\"capabilities\":{\"camera\":true,\"localKnowledge\":true,\"strictWakeGate\":true},\"mode\":\"cascaded\"}\n" {
 		t.Fatalf("expected safe rtc config payload, got: %s", rtcRec.Body.String())
 	}
 }

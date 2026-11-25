@@ -1,0 +1,229 @@
+diff --git a/node_modules/@elevenlabs/client/dist/platform/web/VoiceSessionSetup.js b/node_modules/@elevenlabs/client/dist/platform/web/VoiceSessionSetup.js
+index df5ec5a..7270666 100644
+--- a/node_modules/@elevenlabs/client/dist/platform/web/VoiceSessionSetup.js
++++ b/node_modules/@elevenlabs/client/dist/platform/web/VoiceSessionSetup.js
+@@ -84,9 +84,11 @@ export async function webSessionSetup(options) {
+         }
+         // Some browsers won't allow calling getSupportedConstraints or
+         // enumerateDevices before getting approval for microphone access.
+-        preliminaryInputStream = await navigator.mediaDevices.getUserMedia({
+-            audio: true,
+-        });
++        if (!options.conversationToken) {
++            preliminaryInputStream = await navigator.mediaDevices.getUserMedia({
++                audio: true,
++            });
++        }
+         const platform = detectPlatform();
+         await applyDelay(resolveDelay(options.connectionDelay, platform));
+         const connection = await createConnection(options);
+diff --git a/node_modules/@elevenlabs/client/dist/platform/web/webAudioAdapter.js b/node_modules/@elevenlabs/client/dist/platform/web/webAudioAdapter.js
+index 772aa96..44fe619 100644
+--- a/node_modules/@elevenlabs/client/dist/platform/web/webAudioAdapter.js
++++ b/node_modules/@elevenlabs/client/dist/platform/web/webAudioAdapter.js
+@@ -14,7 +14,9 @@ export class WebAudioAdapter {
+     inputAudioContext = null;
+     audioCaptureContext = null;
+     async attachRemoteTrack(track, outputDeviceId) {
+-        const audioElement = track.attach();
++        const audioElement = document.createElement("audio");
++        audioElement.volume = this.volume;
++        track.attach(audioElement);
+         audioElement.autoplay = true;
+         audioElement.controls = false;
+         audioElement.volume = this.volume;
+@@ -32,6 +34,7 @@ export class WebAudioAdapter {
+         document.body.appendChild(audioElement);
+         // Store reference for volume control and cleanup
+         this.audioElements.push(audioElement);
++        await audioElement.play();
+     }
+     setupInputAnalysis(mediaStreamTrack) {
+         // Clean up previous input audio context
+@@ -56,7 +59,7 @@ export class WebAudioAdapter {
+             this.audioCaptureContext = null;
+         }
+         // Create audio context for processing
+-        const audioContext = new AudioContext();
++        const audioContext = new AudioContext({ sampleRate: format.sampleRate });
+         this.audioCaptureContext = audioContext;
+         // Create analyser for frequency data
+         const analyser = audioContext.createAnalyser();
+diff --git a/node_modules/@elevenlabs/client/dist/utils/BaseConnection.d.ts b/node_modules/@elevenlabs/client/dist/utils/BaseConnection.d.ts
+index 0483621..8e94e52 100644
+--- a/node_modules/@elevenlabs/client/dist/utils/BaseConnection.d.ts
++++ b/node_modules/@elevenlabs/client/dist/utils/BaseConnection.d.ts
+@@ -19,6 +19,10 @@ export type OnOutgoingMessageCallback = (event: any) => void;
+ type KnownTtsModelId = NonNullable<ConversationConfigOverrideTts["model_id"]>;
+ type TtsModelId = KnownTtsModelId | (string & {});
+ export type BaseSessionConfig = {
++    initialMicMuted?: boolean;
++    initialVolume?: number;
++    onPlaybackError?: () => void;
++    sessionSignal?: AbortSignal;
+     origin?: string;
+     authorization?: string;
+     livekitUrl?: string;
+diff --git a/node_modules/@elevenlabs/client/dist/utils/WebRTCConnection.js b/node_modules/@elevenlabs/client/dist/utils/WebRTCConnection.js
+index 20cc469..ca557c6 100644
+--- a/node_modules/@elevenlabs/client/dist/utils/WebRTCConnection.js
++++ b/node_modules/@elevenlabs/client/dist/utils/WebRTCConnection.js
+@@ -41,6 +41,7 @@ export class WebRTCConnection extends BaseConnection {
+     outputFormat;
+     room;
+     isConnected = false;
++    isClosed = false;
+     audioEventId = 1;
+     outputDeviceId = null;
+     audioAdapter;
+@@ -183,6 +184,10 @@ export class WebRTCConnection extends BaseConnection {
+         this.inputFormat = inputFormat;
+         this.outputFormat = outputFormat;
+         this.audioAdapter = createAudioAdapter();
++        this._isMuted = config.initialMicMuted === true;
++        this.audioAdapter?.setVolume(config.initialVolume ?? 1);
++        this.onPlaybackError = config.onPlaybackError;
++        this.sessionSignal = config.sessionSignal;
+         this.workletPaths = config.workletPaths;
+         this.setupRoomEventListeners();
+     }
+@@ -236,12 +241,17 @@ export class WebRTCConnection extends BaseConnection {
+         // default applies unless the caller says otherwise.
+         const singlePeerConnection = config.webRtc?.singlePeerConnection;
+         const room = new Room(singlePeerConnection === undefined ? undefined : { singlePeerConnection });
++        let connection;
++        let abortConnection;
+         try {
+             // Create connection instance first to set up event listeners
+             const conversationId = `room_${Date.now()}`;
+             const inputFormat = parseFormat("pcm_48000");
+             const outputFormat = parseFormat("pcm_48000");
+-            const connection = new WebRTCConnection(room, conversationId, inputFormat, outputFormat, config);
++            connection = new WebRTCConnection(room, conversationId, inputFormat, outputFormat, config);
++            abortConnection = () => connection.close();
++            config.sessionSignal?.addEventListener("abort", abortConnection, { once: true });
++            config.sessionSignal?.throwIfAborted();
+             // Use configurable LiveKit URL or default if not provided
+             const livekitUrl = config.livekitUrl || DEFAULT_LIVEKIT_WS_URL;
+             // Enable microphone on SignalConnected (before room.connect resolves).
+@@ -262,9 +272,12 @@ export class WebRTCConnection extends BaseConnection {
+                 });
+             // Connect to the LiveKit room
+             const iceTransportPolicy = config.webRtc?.iceTransportPolicy;
+-            await room.connect(livekitUrl, conversationToken, {
+-                rtcConfig: iceTransportPolicy ? { iceTransportPolicy } : undefined,
+-            });
++            await Promise.all([
++                room.connect(livekitUrl, conversationToken, {
++                    rtcConfig: iceTransportPolicy ? { iceTransportPolicy } : undefined,
++                }),
++                micEnabled,
++            ]);
+             // Wait for the Connected event to ensure isConnected is true
+             await new Promise(resolve => {
+                 if (connection.isConnected) {
+@@ -279,7 +292,7 @@ export class WebRTCConnection extends BaseConnection {
+                 }
+             });
+             // Ensure the microphone was successfully enabled
+-            await micEnabled;
++            config.sessionSignal?.throwIfAborted();
+             // Set up input analyser from the local mic track for volume metering
+             const micTrack = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+             if (micTrack) {
+@@ -302,9 +315,16 @@ export class WebRTCConnection extends BaseConnection {
+             return connection;
+         }
+         catch (error) {
+-            await room.disconnect();
++            if (connection)
++                connection.close();
++            else
++                await room.disconnect();
+             throw error;
+         }
++        finally {
++            if (abortConnection)
++                config.sessionSignal?.removeEventListener("abort", abortConnection);
++        }
+     }
+     setupRoomEventListeners() {
+         this.room.on(RoomEvent.Connected, () => {
+@@ -355,12 +375,11 @@ export class WebRTCConnection extends BaseConnection {
+                     this.handleMessage(message);
+                 }
+                 else {
+-                    console.warn("Invalid socket event received:", message);
++                    console.warn("Invalid socket event received");
+                 }
+             }
+             catch (error) {
+-                console.warn("Failed to parse incoming data message:", error);
+-                console.warn("Raw payload:", new TextDecoder().decode(payload));
++                console.warn("Failed to parse incoming data message");
+             }
+         });
+         this.room.on(RoomEvent.TrackSubscribed, async (track, _publication, participant) => {
+@@ -435,7 +454,15 @@ export class WebRTCConnection extends BaseConnection {
+     async playRemoteAudio(track) {
+         if (!this.audioAdapter)
+             return;
+-        await this.audioAdapter.attachRemoteTrack(track, this.outputDeviceId);
++        try {
++            await this.audioAdapter.attachRemoteTrack(track, this.outputDeviceId);
++        }
++        catch (error) {
++            if (!this.onPlaybackError)
++                throw error;
++            this.onPlaybackError();
++            return;
++        }
+         await this.syncCapture();
+         this.onDebug?.({ type: "audio_element_ready" });
+     }
+@@ -463,7 +490,10 @@ export class WebRTCConnection extends BaseConnection {
+         };
+     }
+     close() {
+-        if (this.isConnected) {
++        if (this.isClosed)
++            return;
++        this.isClosed = true;
++        {
+             try {
+                 // Explicitly stop all local tracks before disconnecting to ensure microphone is released
+                 this.room.localParticipant.audioTrackPublications.forEach(publication => {
+@@ -645,16 +675,23 @@ export class WebRTCConnection extends BaseConnection {
+         this.setupInputAnalyser(audioTrack.mediaStreamTrack);
+     }
+     async enableMicrophone(inputDeviceId) {
+-        if (!inputDeviceId) {
++        if (!inputDeviceId && !this._isMuted && !this.sessionSignal) {
+             await this.room.localParticipant.setMicrophoneEnabled(true);
+             return;
+         }
+         const audioTrack = await this.createMicrophoneTrack(inputDeviceId);
+         try {
++            this.sessionSignal?.throwIfAborted();
++            if (this.isClosed)
++                throw new Error("Voice connection was closed before microphone publication.");
++            if (this._isMuted)
++                await audioTrack.mute();
++            this.sessionSignal?.throwIfAborted();
+             await this.room.localParticipant.publishTrack(audioTrack, {
+                 name: "microphone",
+                 source: Track.Source.Microphone,
+             });
++            this.sessionSignal?.throwIfAborted();
+         }
+         catch (error) {
+             // An unpublished track is unknown to the room, so disconnecting would
+@@ -665,7 +702,7 @@ export class WebRTCConnection extends BaseConnection {
+     }
+     createMicrophoneTrack(deviceId) {
+         return createLocalAudioTrack({
+-            deviceId: { exact: deviceId },
++            ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+             echoCancellation: true,
+             noiseSuppression: true,
+             autoGainControl: true,

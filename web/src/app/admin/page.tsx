@@ -22,6 +22,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { apiFetch, fetchSession, AuthUser } from "@/lib/api-client";
+import { HostedMCPControls, type HostedMCPMode } from "@/components/HostedMCPControls";
 import {
   addLanguage,
   applyRecommendedElevenLabsVoices,
@@ -51,12 +52,17 @@ interface DocRecord {
   sizeBytes: number;
   status: "processing" | "ready" | "failed";
   errorMessage?: string;
+  elevenLabsSyncStatus?: "synced" | "indexing" | "failed" | "not_synced";
+  elevenLabsSyncError?: string;
   chunkCount: number;
   createdAt: string;
 }
 
 interface AgentConfig {
-  mode: "cascaded" | "realtime";
+  mode: "cascaded" | "realtime" | "elevenlabs_agent";
+  elevenLabsAgentId: string;
+  elevenLabsRagSyncEnabled: boolean;
+  elevenLabsAgentSkillsSyncEnabled: boolean;
   assistantName: string;
   wakeAliases: string[];
   realtimeWsUrl: string;
@@ -111,6 +117,9 @@ interface MCPServer {
   allowedTools: string[];
   discoveredTools: { name: string; description?: string }[];
   timeoutMs: number;
+  hostedMode?: HostedMCPMode;
+  hostedSyncStatus?: string;
+  hostedSyncError?: string;
 }
 
 interface AuditLog {
@@ -139,10 +148,15 @@ export default function AdminPage() {
   // RAG state
   const [docs, setDocs] = useState<DocRecord[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [syncingHosted, setSyncingHosted] = useState(false);
+  const [savedHostedPolicy, setSavedHostedPolicy] = useState({ rag: true, skills: true });
 
   // Agent config state
   const [cfg, setCfg] = useState<AgentConfig>({
     mode: "cascaded",
+    elevenLabsAgentId: "",
+    elevenLabsRagSyncEnabled: true,
+    elevenLabsAgentSkillsSyncEnabled: true,
     assistantName: "Aegis",
     wakeAliases: [],
     realtimeWsUrl: "",
@@ -192,6 +206,7 @@ export default function AdminPage() {
 
   // MCP state
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([]);
+  const [hostedProxyAvailable, setHostedProxyAvailable] = useState(false);
   const [mcpName, setMcpName] = useState("");
   const [mcpUrl, setMcpUrl] = useState("");
   const [mcpAuth, setMcpAuth] = useState("");
@@ -227,7 +242,7 @@ export default function AdminPage() {
   useEffect(() => {
     if (!me) return;
 
-    if (cfg.speechProvider === "elevenlabs") {
+    if (cfg.mode === "cascaded" && cfg.speechProvider === "elevenlabs") {
       setVoiceLangs((current) => ({
         ...current,
         languages: applyRecommendedElevenLabsVoices(
@@ -266,7 +281,7 @@ export default function AdminPage() {
     return () => {
       active = false;
     };
-  }, [cfg.speechProvider, me]);
+  }, [cfg.mode, cfg.speechProvider, me]);
 
   const elevenLabsVoiceOptions =
     ttsVoiceDiscovery.voiceOptions?.length
@@ -284,7 +299,7 @@ export default function AdminPage() {
         apiFetch<{ documents: DocRecord[] }>("/api/v1/admin/documents"),
         apiFetch<{ config: AgentConfig }>("/api/v1/admin/agent-config"),
         apiFetch<VoiceLanguageSettings>("/api/v1/admin/voice-languages"),
-        apiFetch<{ servers: MCPServer[] }>("/api/v1/admin/mcp-servers"),
+        apiFetch<{ servers: MCPServer[]; hostedProxyAvailable?: boolean }>("/api/v1/admin/mcp-servers"),
         apiFetch<{ skills: AgentSkill[] }>("/api/v1/admin/skills"),
         apiFetch<{ logs: AuditLog[] }>("/api/v1/admin/audit-logs"),
         apiFetch<TTSVoiceDiscovery>("/api/v1/admin/tts-voices"),
@@ -293,6 +308,10 @@ export default function AdminPage() {
       setUsers(uRes.users || []);
       setDocs(dRes.documents || []);
       if (cRes.config) {
+        setSavedHostedPolicy({
+          rag: cRes.config.elevenLabsRagSyncEnabled !== false,
+          skills: cRes.config.elevenLabsAgentSkillsSyncEnabled !== false,
+        });
         const loadedAssistantName =
           typeof cRes.config.assistantName === "string" && cRes.config.assistantName.trim() !== ""
             ? cRes.config.assistantName
@@ -303,6 +322,8 @@ export default function AdminPage() {
           ...cRes.config,
           assistantName: loadedAssistantName,
           wakeAliases: loadedAliases,
+          elevenLabsRagSyncEnabled: cRes.config.elevenLabsRagSyncEnabled !== false,
+          elevenLabsAgentSkillsSyncEnabled: cRes.config.elevenLabsAgentSkillsSyncEnabled !== false,
         }));
         setWakeAliasesInput(loadedAliases.join(", "));
       }
@@ -312,12 +333,30 @@ export default function AdminPage() {
         setSelectedAddLang(avail[0]?.code || "");
       }
       setMcpServers(mRes.servers || []);
+      setHostedProxyAvailable(mRes.hostedProxyAvailable === true);
       setAgentSkills(skillsRes.skills || []);
       setLogs(aRes.logs || []);
       setTTSVoiceDiscovery(voicesRes);
       setSTTModelDiscovery(modelsRes);
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to load admin data" });
+    }
+  }
+
+  async function handleSyncHostedDocuments() {
+    setSyncingHosted(true);
+    setNotice(null);
+    try {
+      await apiFetch("/api/v1/admin/agent-config/sync", { method: "POST", body: "{}" });
+      setNotice({
+        type: "ok",
+        text: `Hosted base prompt and selected MCP sync completed. RAG documents: ${savedHostedPolicy.rag ? "synchronized" : "application sync disabled"}. Agent Skills: ${savedHostedPolicy.skills ? "synchronized" : "application sync disabled"}.`,
+      });
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Hosted synchronization failed" });
+    } finally {
+      await loadAll();
+      setSyncingHosted(false);
     }
   }
 
@@ -365,13 +404,17 @@ export default function AdminPage() {
     setUploading(true);
     setNotice(null);
     try {
+      let hostedWarning = "";
       for (const file of Array.from(files)) {
         const fd = new FormData();
         fd.append("file", file);
         fd.append("title", file.name);
-        await apiFetch("/api/v1/admin/documents", { method: "POST", body: fd });
+        const result = await apiFetch<{ warning?: string }>("/api/v1/admin/documents", { method: "POST", body: fd });
+        if (result.warning) hostedWarning = result.warning;
       }
-      setNotice({ type: "ok", text: "Document(s) uploaded and indexed." });
+      setNotice(hostedWarning
+        ? { type: "err", text: hostedWarning }
+        : { type: "ok", text: "Document(s) uploaded and indexed." });
       await loadAll();
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Upload failed" });
@@ -438,7 +481,7 @@ export default function AdminPage() {
     e.preventDefault();
     setNotice(null);
     try {
-      if (cfg.speechProvider === "elevenlabs") {
+      if (cfg.mode === "cascaded" && cfg.speechProvider === "elevenlabs") {
         const missingVoice = missingDefaultProviderVoice(
           voiceLangs.languages,
           voiceLangs.defaultLanguage,
@@ -470,6 +513,9 @@ export default function AdminPage() {
 
       const payload = {
         mode: cfg.mode,
+        elevenLabsAgentId: cfg.elevenLabsAgentId,
+        elevenLabsRagSyncEnabled: cfg.elevenLabsRagSyncEnabled,
+        elevenLabsAgentSkillsSyncEnabled: cfg.elevenLabsAgentSkillsSyncEnabled,
         assistantName: cfg.assistantName,
         wakeAliases: parseWakeAliasesInput(wakeAliasesInput),
         realtimeWsUrl: cfg.realtimeWsUrl,
@@ -507,10 +553,15 @@ export default function AdminPage() {
           wakeAliases: savedAliases,
         }));
         setWakeAliasesInput(savedAliases.join(", "));
+        setSavedHostedPolicy({
+          rag: res.config.elevenLabsRagSyncEnabled ?? payload.elevenLabsRagSyncEnabled,
+          skills: res.config.elevenLabsAgentSkillsSyncEnabled ?? payload.elevenLabsAgentSkillsSyncEnabled,
+        });
       }
       setNewApiKey("");
       setNewElevenLabsApiKey("");
       setNotice({ type: "ok", text: "AI Agent configuration saved and encrypted." });
+      if (cfg.mode === "elevenlabs_agent") return;
       try {
         const [voicesRes, modelsRes] = await Promise.all([
           apiFetch<TTSVoiceDiscovery>("/api/v1/admin/tts-voices"),
@@ -537,12 +588,21 @@ export default function AdminPage() {
     try {
       const res = await apiFetch<{ ok: boolean; message?: string; statusCode?: number }>(
         "/api/v1/admin/agent-config/test",
-        { method: "POST" }
+        {
+          method: "POST",
+          ...(cfg.mode === "elevenlabs_agent" ? {
+            body: JSON.stringify({
+              mode: cfg.mode,
+              elevenLabsAgentId: cfg.elevenLabsAgentId,
+              elevenLabsApiKey: newElevenLabsApiKey,
+            }),
+          } : {}),
+        }
       );
       setNotice({
         type: res.ok ? "ok" : "err",
         text: res.ok
-          ? `Connection verified (status ${res.statusCode ?? 200}).`
+          ? res.message || `Connection verified (status ${res.statusCode ?? 200}).`
           : res.message || "Connection check failed.",
       });
     } catch (err) {
@@ -588,6 +648,7 @@ export default function AdminPage() {
           enabled: true,
           allowedTools: [],
           timeoutMs: 10000,
+          hostedMode: "disabled",
         }),
       });
       setMcpName("");
@@ -608,10 +669,12 @@ export default function AdminPage() {
       await loadAll();
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "MCP discovery failed" });
+      await loadAll();
     }
   }
 
   async function handleToggleMCPTool(srv: MCPServer, toolName: string) {
+    if (srv.hostedMode === "direct" && !window.confirm("This change shares the MCP endpoint and authentication with ElevenLabs. Direct mode requires every discovered tool to be allowlisted. External tools may send conversation data and cause side effects. Continue?")) return;
     const exists = srv.allowedTools?.includes(toolName);
     const updated = exists
       ? srv.allowedTools.filter((t) => t !== toolName)
@@ -626,11 +689,13 @@ export default function AdminPage() {
           enabled: srv.enabled,
           allowedTools: updated,
           timeoutMs: srv.timeoutMs,
+          directCredentialSharingConfirmed: srv.hostedMode === "direct",
         }),
       });
       await loadAll();
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to update tool allowlist" });
+      await loadAll();
     }
   }
 
@@ -647,6 +712,7 @@ export default function AdminPage() {
   }
 
   async function handleToggleMCPServer(srv: MCPServer) {
+    if (!srv.enabled && srv.hostedMode === "direct" && !window.confirm("Enabling this server shares its endpoint and authentication with ElevenLabs and allows external tool side effects. Continue?")) return;
     setNotice(null);
     try {
       await apiFetch(`/api/v1/admin/mcp-servers/${srv.id}`, {
@@ -658,12 +724,14 @@ export default function AdminPage() {
           enabled: !srv.enabled,
           allowedTools: srv.allowedTools || [],
           timeoutMs: srv.timeoutMs,
+          directCredentialSharingConfirmed: srv.hostedMode === "direct",
         }),
       });
       setNotice({ type: "ok", text: `${srv.name} ${srv.enabled ? "disabled" : "enabled"}.` });
       await loadAll();
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to update MCP server" });
+      await loadAll();
     }
   }
 
@@ -673,6 +741,31 @@ export default function AdminPage() {
       await loadAll();
     } catch (err) {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Failed to delete MCP server" });
+      await loadAll();
+    }
+  }
+
+  async function handleSaveHostedMCP(srv: MCPServer, mode: HostedMCPMode, confirmed: boolean): Promise<void> {
+    try {
+      await apiFetch(`/api/v1/admin/mcp-servers/${srv.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: srv.name, transport: srv.transport, endpointUrl: srv.endpointUrl,
+          enabled: srv.enabled, allowedTools: srv.allowedTools || [], timeoutMs: srv.timeoutMs,
+          hostedMode: mode, directCredentialSharingConfirmed: mode === "direct" && confirmed,
+        }),
+      });
+      setNotice({ type: "ok", text: "Hosted integration saved. Review its synchronization status." });
+    } finally {
+      await loadAll();
+    }
+  }
+
+  async function handleRetryHostedMCP(id: string): Promise<void> {
+    try {
+      await apiFetch(`/api/v1/admin/mcp-servers/${id}/sync`, { method: "POST" });
+    } finally {
+      await loadAll();
     }
   }
 
@@ -859,6 +952,26 @@ export default function AdminPage() {
 
         {tab === "rag" && (
           <div className="space-y-6">
+            {cfg.mode === "elevenlabs_agent" && (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 p-4 text-sm text-amber-100">
+                <p>
+                  {savedHostedPolicy.rag
+                    ? "Ready local documents sync additively to hosted RAG; dashboard-managed documents are preserved."
+                    : "RAG application sync disabled. Local pgvector processing continues; dashboard-managed knowledge remains available."}
+                  {" "}Manual sync always updates the base prompt and selected MCP integrations; only enabled application domains synchronize.
+                  Hosted processing may incur charges. Validated hosted workflow tools run through ElevenLabs; camera and local citations are unavailable.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleSyncHostedDocuments}
+                  disabled={syncingHosted}
+                  className="flex shrink-0 items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-xs text-white hover:bg-slate-800 disabled:opacity-50"
+                >
+                  {syncingHosted && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  {syncingHosted ? "Syncing hosted agent..." : "Sync / retry hosted agent"}
+                </button>
+              </div>
+            )}
             <label
               onDragOver={(e: DragEvent) => e.preventDefault()}
               onDrop={(e: DragEvent) => {
@@ -887,6 +1000,7 @@ export default function AdminPage() {
                   <tr>
                     <th className="px-4 py-3">Document</th>
                     <th className="px-4 py-3">Status</th>
+                    {cfg.mode === "elevenlabs_agent" && <th className="px-4 py-3">Hosted sync</th>}
                     <th className="px-4 py-3">Chunks</th>
                     <th className="px-4 py-3 text-right">Actions</th>
                   </tr>
@@ -914,6 +1028,31 @@ export default function AdminPage() {
                           <p className="mt-1 text-xs text-rose-300">{d.errorMessage}</p>
                         )}
                       </td>
+                      {cfg.mode === "elevenlabs_agent" && (
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const syncStatus = d.elevenLabsSyncStatus || "not_synced";
+                            const syncClass = syncStatus === "synced"
+                              ? "bg-emerald-500/15 text-emerald-300"
+                              : syncStatus === "indexing"
+                                ? "bg-amber-500/15 text-amber-300"
+                                : syncStatus === "failed"
+                                  ? "bg-rose-500/15 text-rose-300"
+                                  : "bg-slate-700/60 text-slate-300";
+                            return (
+                              <>
+                                <span className={`rounded-full px-2.5 py-0.5 text-xs ${savedHostedPolicy.rag ? syncClass : "bg-slate-700/60 text-slate-300"}`}>
+                                  {savedHostedPolicy.rag ? syncStatus : "Application sync disabled"}
+                                </span>
+                                {!savedHostedPolicy.rag && <p className="mt-1 text-xs text-slate-400">Last known hosted state: {syncStatus}</p>}
+                                {savedHostedPolicy.rag && syncStatus === "failed" && d.elevenLabsSyncError && (
+                                  <p className="mt-1 text-xs text-rose-300">{d.elevenLabsSyncError}</p>
+                                )}
+                              </>
+                            );
+                          })()}
+                        </td>
+                      )}
                       <td className="px-4 py-3 text-slate-300">{d.chunkCount}</td>
                       <td className="px-4 py-3 text-right">
                         <button
@@ -928,7 +1067,7 @@ export default function AdminPage() {
                   ))}
                   {docs.length === 0 && (
                     <tr>
-                      <td colSpan={4} className="px-4 py-8 text-center text-slate-500">
+                      <td colSpan={cfg.mode === "elevenlabs_agent" ? 5 : 4} className="px-4 py-8 text-center text-slate-500">
                         No documents indexed yet.
                       </td>
                     </tr>
@@ -964,7 +1103,9 @@ export default function AdminPage() {
                   className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
                 />
                 <p className="mt-1 text-[11px] text-slate-400">
-                  Primary wake name required at the start of voice turns (English or Chinese, e.g. Aegis, Jarvis, 小智).
+                  {cfg.mode === "elevenlabs_agent"
+                    ? "Synchronizes the hosted agent persona label; backend wake-name gating does not apply."
+                    : "Primary wake name required at the start of voice turns (English or Chinese, e.g. Aegis, Jarvis, 小智)."}
                 </p>
               </div>
               <div>
@@ -980,26 +1121,92 @@ export default function AdminPage() {
                   type="text"
                   autoComplete="off"
                   value={wakeAliasesInput}
+                  disabled={cfg.mode === "elevenlabs_agent"}
                   onChange={(e) => setWakeAliasesInput(e.target.value)}
                   placeholder="Optional comma-separated aliases, e.g. 小智, Aegis"
                   className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
                 />
                 <p className="mt-1 text-[11px] text-slate-400">
-                  Optional alternate wake names in English or Chinese separated by commas.
+                  Optional alternate wake names in English or Chinese separated by commas. Backend modes only.
                 </p>
               </div>
 
               <div>
-                <label className="mb-1 block text-xs uppercase text-slate-400">Pipeline Mode</label>
+                <label htmlFor="pipeline-mode" className="mb-1 block text-xs uppercase text-slate-400">Pipeline Mode</label>
                 <select
+                  id="pipeline-mode"
                   value={cfg.mode}
-                  onChange={(e) => setCfg({ ...cfg, mode: e.target.value as "cascaded" | "realtime" })}
+                  onChange={(e) => setCfg({ ...cfg, mode: e.target.value as AgentConfig["mode"] })}
                   className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
                 >
                   <option value="cascaded">Cascaded (STT → Vision/RAG LLM → TTS)</option>
                   <option value="realtime">Realtime Multimodal WebSocket</option>
+                  <option value="elevenlabs_agent">ElevenLabs Hosted Agent (Speech + RAG + Model)</option>
                 </select>
               </div>
+              {cfg.mode === "elevenlabs_agent" && (
+                <>
+                  <div className="col-span-full rounded-xl border border-amber-500/30 p-4 text-xs text-slate-300">
+                    This app always synchronizes Assistant Name and System Instructions.
+                    Application RAG and Agent Skill synchronization are independently optional and enabled by default.
+                    Additional dashboard-managed content is preserved. The dashboard owns
+                    the LLM, voice, TTS model, spoken languages, turn-taking, and retention. Speech and
+                    documents are processed externally and may incur charges.
+                    Use a private, authentication-enabled agent with a supported workflow and server-side tools.
+                    Validated workflows and provider-managed tools run through ElevenLabs, not the local tool loop.
+                    External actions may send conversation data to external services, incur charges, and cause side effects.
+                    Application MCP servers remain unshared until explicitly configured. Camera input and local citations are unavailable. Test Connection checks access
+                    and compatibility, not policy grounding or playback.
+                  </div>
+                  <div>
+                    <label htmlFor="elevenlabs-agent-id" className="mb-1 block text-xs uppercase text-slate-400">Private ElevenLabs Agent ID</label>
+                    <input id="elevenlabs-agent-id" type="text" autoComplete="off"
+                      value={cfg.elevenLabsAgentId}
+                      onChange={(e) => setCfg({ ...cfg, elevenLabsAgentId: e.target.value })}
+                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white" />
+                  </div>
+                  <div className="col-span-full space-y-4 rounded-xl border border-slate-700/60 p-4">
+                    <div>
+                      <label htmlFor="hosted-rag-sync" className="flex items-center gap-2 text-sm text-white">
+                        <input id="hosted-rag-sync" type="checkbox"
+                          checked={cfg.elevenLabsRagSyncEnabled}
+                          onChange={(e) => setCfg({ ...cfg, elevenLabsRagSyncEnabled: e.target.checked })} />
+                        Synchronize application RAG documents
+                      </label>
+                      <p className="mt-1 text-xs text-slate-400">
+                        Disabling detaches and deletes only tracked application-hosted documents after verification.
+                        Local pgvector documents and dashboard-managed knowledge remain unchanged.
+                        A cleanup failure keeps the saved policy unchanged; retry Save Encrypted Config.
+                      </p>
+                    </div>
+                    <div>
+                      <label htmlFor="hosted-skills-sync" className="flex items-center gap-2 text-sm text-white">
+                        <input id="hosted-skills-sync" type="checkbox"
+                          checked={cfg.elevenLabsAgentSkillsSyncEnabled}
+                          onChange={(e) => setCfg({ ...cfg, elevenLabsAgentSkillsSyncEnabled: e.target.checked })} />
+                        Synchronize application Agent Skills
+                      </label>
+                      <p className="mt-1 text-xs text-slate-400">
+                        Disabling rebuilds and verifies the application prompt without skill sections.
+                        Local skills and unrelated dashboard-managed configuration remain unchanged.
+                        Assistant Name, security instructions, and System Instructions still synchronize.
+                      </p>
+                    </div>
+                  </div>
+                </>
+              )}
+              {(cfg.mode === "elevenlabs_agent" || cfg.speechProvider === "elevenlabs") && (
+                <div>
+                  <label htmlFor="elevenlabs-api-key" className="mb-1 block text-xs uppercase text-slate-400">
+                    ElevenLabs API Key (Write-Only{cfg.elevenLabsApiKeyPreview ? ` • Current: ${cfg.elevenLabsApiKeyPreview}` : ""})
+                  </label>
+                  <input id="elevenlabs-api-key" type="password" autoComplete="new-password"
+                    value={newElevenLabsApiKey} onChange={(e) => setNewElevenLabsApiKey(e.target.value)}
+                    placeholder={cfg.elevenLabsApiKeyPreview || "Enter ElevenLabs API key (leave blank to keep existing)"}
+                    className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white" />
+                </div>
+              )}
+              <fieldset disabled={cfg.mode === "elevenlabs_agent"} className={cfg.mode === "elevenlabs_agent" ? "hidden" : "contents"}>
               <div>
                 <label className="mb-1 block text-xs uppercase text-slate-400">
                   Provider API Key (Write-Only {cfg.apiKeyPreview ? `• Current: ${cfg.apiKeyPreview}` : ""})
@@ -1032,19 +1239,6 @@ export default function AdminPage() {
               </div>
               {cfg.speechProvider === "elevenlabs" ? (
                 <>
-                  <div>
-                    <label className="mb-1 block text-xs uppercase text-slate-400">
-                      ElevenLabs API Key (Write-Only{cfg.elevenLabsApiKeyPreview ? ` • Current: ${cfg.elevenLabsApiKeyPreview}` : ""})
-                    </label>
-                    <input
-                      type="password"
-                      autoComplete="new-password"
-                      value={newElevenLabsApiKey}
-                      onChange={(e) => setNewElevenLabsApiKey(e.target.value)}
-                      placeholder={cfg.elevenLabsApiKeyPreview || "Enter ElevenLabs API key"}
-                      className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
-                    />
-                  </div>
                   <div>
                     <label className="mb-1 block text-xs uppercase text-slate-400">
                       ElevenLabs STT Model
@@ -1195,18 +1389,26 @@ export default function AdminPage() {
                   className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
                 />
               </div>
+              </fieldset>
             </div>
 
             <div>
-              <label className="mb-1 block text-xs uppercase text-slate-400">System Instructions</label>
+              <label htmlFor="system-instructions" className="mb-1 block text-xs uppercase text-slate-400">System Instructions</label>
               <textarea
+                id="system-instructions"
                 rows={3}
                 value={cfg.systemInstructions}
                 onChange={(e) => setCfg({ ...cfg, systemInstructions: e.target.value })}
                 className="w-full rounded-xl border border-slate-700/60 bg-slate-950/70 px-3 py-2 text-sm text-white"
               />
+              {cfg.mode === "elevenlabs_agent" && (
+                <p className="mt-1 text-xs text-slate-400">
+                  Automatically synchronized to the hosted agent when saved.
+                </p>
+              )}
             </div>
 
+            <fieldset disabled={cfg.mode === "elevenlabs_agent"} className={cfg.mode === "elevenlabs_agent" ? "hidden" : "contents"}>
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-700/60 bg-slate-950/50 p-4">
               <input
                 type="checkbox"
@@ -1222,6 +1424,7 @@ export default function AdminPage() {
                 </span>
               </span>
             </label>
+            </fieldset>
 
             <div className="flex flex-wrap gap-3">
               <button
@@ -1244,9 +1447,10 @@ export default function AdminPage() {
 
           <div className="space-y-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-6">
             <div>
-              <h2 className="text-base font-semibold text-white">Voice languages</h2>
+              <h2 className="text-base font-semibold text-white">{cfg.mode === "elevenlabs_agent" ? "Retained backend voice languages" : "Voice languages"}</h2>
               <p className="mt-1 text-xs text-slate-400">
                 Choose which spoken languages the assistant handles, assign a speech voice per language, and pick one default language for fallback replies.
+                {cfg.mode === "elevenlabs_agent" && " These settings are backend-only and do not change hosted languages or voices."}
               </p>
             </div>
 
@@ -1470,6 +1674,7 @@ export default function AdminPage() {
 
         {tab === "mcp" && (
           <div className="space-y-6">
+            <p className="text-sm text-slate-400">New MCP servers are not shared with hosted agents. Discover and allowlist tools, then explicitly choose a hosted integration below.</p>
             <form
               onSubmit={handleAddMCP}
               autoComplete="off"
@@ -1576,6 +1781,15 @@ export default function AdminPage() {
                       </button>
                     </div>
                   </div>
+                  <HostedMCPControls
+                    mode={s.hostedMode}
+                    status={s.hostedSyncStatus}
+                    error={s.hostedSyncError}
+                    allowedTools={s.allowedTools || []}
+                    proxyAvailable={hostedProxyAvailable}
+                    onSave={(mode, confirmed) => handleSaveHostedMCP(s, mode, confirmed)}
+                    onRetry={() => handleRetryHostedMCP(s.id)}
+                  />
                   {s.discoveredTools && s.discoveredTools.length > 0 && !toolsHidden && (
                     <div id={toolsPanelId} className="mt-4 flex flex-wrap gap-2">
                       {s.discoveredTools.map((tool) => {
@@ -1611,6 +1825,13 @@ export default function AdminPage() {
 
         {tab === "skills" && (
           <div className="space-y-6">
+            {cfg.mode === "elevenlabs_agent" && (
+              <p className="rounded-xl border border-slate-700/60 p-4 text-sm text-slate-300">
+                {savedHostedPolicy.skills
+                  ? "Agent Skill application sync enabled. Enabled local skills synchronize into the hosted prompt and require available hosted tools."
+                  : "Agent Skill application sync disabled. Uploads, toggles, and deletion stay local; dashboard-managed configuration remains unchanged. Hosted skill-tool readiness does not apply."}
+              </p>
+            )}
             <label
               onDragEnter={(e: DragEvent<HTMLLabelElement>) => {
                 e.preventDefault();
@@ -1660,7 +1881,9 @@ export default function AdminPage() {
               <div className="space-y-4">
                 {agentSkills.map((skill) => {
                   const metadata = formatSkillMetadata(skill);
-                  const toolReadiness = getSkillToolReadiness(skill.allowedTools || [], mcpServers);
+                  const toolReadiness = cfg.mode === "elevenlabs_agent" && !savedHostedPolicy.skills
+                    ? []
+                    : getSkillToolReadiness(skill.allowedTools || [], mcpServers, cfg.mode === "elevenlabs_agent");
                   const isExpanded = expandedSkills.has(skill.id);
                   return (
                     <article

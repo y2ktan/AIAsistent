@@ -18,6 +18,9 @@ export interface MCPServerToolAccess {
   name: string;
   enabled: boolean;
   allowedTools: string[];
+  hostedMode?: "disabled" | "direct" | "proxy";
+  hostedSyncStatus?: string;
+  discoveredTools?: { name: string }[];
 }
 
 export interface SkillToolReadiness {
@@ -35,11 +38,14 @@ export interface SkillMetadata {
 
 export function getSkillToolReadiness(
   allowedTools: string[],
-  servers: MCPServerToolAccess[]
+  servers: MCPServerToolAccess[],
+  hosted = false
 ): SkillToolReadiness[] {
   return [...new Set(allowedTools.map((tool) => tool.trim()).filter(Boolean))].map((toolName) => {
     const serverNames = servers
-      .filter((server) => server.enabled && server.allowedTools.includes(toolName))
+      .filter((server) => server.enabled && server.allowedTools.includes(toolName) &&
+        (!hosted || ((server.hostedMode === "direct" || server.hostedMode === "proxy") &&
+          server.hostedSyncStatus === "synced" && server.discoveredTools?.some((tool) => tool.name === toolName))))
       .map((server) => server.name)
       .sort((a, b) => a.localeCompare(b));
     return {

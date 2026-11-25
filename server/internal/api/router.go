@@ -21,11 +21,13 @@ func (s *Server) Router() http.Handler {
 
 	loginLimiter := auth.NewKeyedRateLimiter(5.0/60.0, 5)
 	sigLimiter := auth.NewKeyedRateLimiter(10.0/60.0, 10)
+	hostedLimiter := auth.NewKeyedRateLimiter(10.0/60.0, 10)
 	uploadLimiter := auth.NewKeyedRateLimiter(10.0/3600.0, 5)
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.Handle("POST /api/v1/hosted-mcp/{id}", http.HandlerFunc(s.HandleHostedMCPProxy))
 
 	// Auth routes
 	mux.Handle("GET /api/v1/auth/bootstrap-status", http.HandlerFunc(s.authSvc.HandleBootstrapStatus))
@@ -47,6 +49,14 @@ func (s *Server) Router() http.Handler {
 	)
 
 	// WebRTC Signaling routes
+	mux.Handle("POST /api/v1/elevenlabs/conversation-token",
+		s.authSvc.RequireAuth(s.authSvc.RequireCSRF(
+			auth.RateLimitMiddleware(hostedLimiter, func(r *http.Request) string {
+				user, _ := auth.UserFromContext(r.Context())
+				return user.ID
+			})(http.HandlerFunc(s.HandleHostedConversationToken)),
+		)),
+	)
 	mux.Handle("GET /api/v1/rtc/config",
 		s.authSvc.RequireAuth(http.HandlerFunc(s.HandleRTCConfig)),
 	)
@@ -74,6 +84,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("POST /api/v1/admin/documents",
 		auth.RateLimitMiddleware(uploadLimiter, auth.ClientIP)(admin(s.HandleUploadDocument)),
 	)
+	mux.Handle("POST /api/v1/admin/documents/{id}/reindex", admin(s.HandleReindexDocument))
 	mux.Handle("DELETE /api/v1/admin/documents/{id}", admin(s.HandleDeleteDocument))
 
 	mux.Handle("GET /api/v1/admin/skills", admin(s.HandleListAgentSkills))
@@ -85,6 +96,7 @@ func (s *Server) Router() http.Handler {
 
 	mux.Handle("GET /api/v1/admin/agent-config", admin(s.HandleGetAgentConfig))
 	mux.Handle("PUT /api/v1/admin/agent-config", admin(s.HandleUpdateAgentConfig))
+	mux.Handle("POST /api/v1/admin/agent-config/sync", admin(s.HandleSyncHostedAgent))
 	mux.Handle("POST /api/v1/admin/agent-config/test", admin(s.HandleTestAgentConfig))
 	mux.Handle("GET /api/v1/admin/tts-voices", admin(s.HandleDiscoverTTSVoices))
 	mux.Handle("GET /api/v1/admin/stt-models", admin(s.HandleDiscoverSTTModels))
@@ -95,6 +107,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("POST /api/v1/admin/mcp-servers", admin(s.HandleUpsertMCPServer))
 	mux.Handle("PUT /api/v1/admin/mcp-servers/{id}", admin(s.HandleUpsertMCPServer))
 	mux.Handle("POST /api/v1/admin/mcp-servers/{id}/discover", admin(s.HandleDiscoverMCPServer))
+	mux.Handle("POST /api/v1/admin/mcp-servers/{id}/sync", admin(s.HandleRetryHostedMCP))
 	mux.Handle("DELETE /api/v1/admin/mcp-servers/{id}", admin(s.HandleDeleteMCPServer))
 
 	mux.Handle("GET /api/v1/admin/audit-logs", admin(s.HandleListAuditLogs))

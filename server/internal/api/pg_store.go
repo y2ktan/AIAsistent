@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"aegis-voice/server/internal/agent"
@@ -15,11 +17,48 @@ import (
 )
 
 type PGAdminStore struct {
-	pool *pgxpool.Pool
+	pool interface {
+		Query(context.Context, string, ...any) (pgx.Rows, error)
+		QueryRow(context.Context, string, ...any) pgx.Row
+		Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+		Begin(context.Context) (pgx.Tx, error)
+		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	}
+	lockPool *pgxpool.Pool
 }
 
 func NewPGAdminStore(pool *pgxpool.Pool) *PGAdminStore {
-	return &PGAdminStore{pool: pool}
+	return &PGAdminStore{pool: pool, lockPool: pool}
+}
+
+func (s *PGAdminStore) WithHostedMCPLock(ctx context.Context, fn func(AdminStore) error) error {
+	if s.lockPool == nil {
+		return fn(s)
+	}
+	conn, err := s.lockPool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	const lockID int64 = 714095708151
+	var locked bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockID).Scan(&locked); err != nil {
+		return err
+	}
+	if !locked {
+		return errors.New("Hosted MCP reconciliation is busy. Retry shortly.")
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var unlocked bool
+		if err := conn.QueryRow(cleanup, "SELECT pg_advisory_unlock($1)", lockID).Scan(&unlocked); err != nil || !unlocked {
+			// Never return a connection holding a session lock to the pool.
+			_ = conn.Conn().Close(cleanup)
+		}
+	}()
+	// Autocommit persists creation intent before the provider request.
+	return fn(&PGAdminStore{pool: conn})
 }
 
 func (s *PGAdminStore) ListUsers(ctx context.Context) ([]auth.User, error) {
@@ -106,7 +145,8 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		       rag_top_k, rag_min_similarity, audio_focus_enabled,
 		       assistant_name, wake_aliases, speech_provider,
 		       elevenlabs_stt_model, elevenlabs_tts_model,
-		       elevenlabs_api_key_ciphertext, elevenlabs_api_key_last5, updated_at
+		       elevenlabs_api_key_ciphertext, elevenlabs_api_key_last5, elevenlabs_agent_id,
+		       elevenlabs_rag_sync_enabled, elevenlabs_agent_skills_sync_enabled, updated_at
 		FROM agent_configs WHERE name = 'default'
 	`).Scan(
 		&r.ID, &r.Name, &r.Mode, &r.RealtimeWSURL, &r.RealtimeModel,
@@ -117,26 +157,29 @@ func (s *PGAdminStore) GetAgentConfig(ctx context.Context) (*AgentConfigRecord, 
 		&r.RAGTopK, &r.RAGMinSimilarity, &r.AudioFocusEnabled,
 		&r.AssistantName, &r.WakeAliases, &r.SpeechProvider,
 		&r.ElevenLabsSTTModel, &r.ElevenLabsTTSModel,
-		&r.ElevenLabsAPIKeyCiphertext, &r.ElevenLabsAPIKeyLast5, &r.UpdatedAt,
+		&r.ElevenLabsAPIKeyCiphertext, &r.ElevenLabsAPIKeyLast5, &r.ElevenLabsAgentID,
+		&r.ElevenLabsRAGSyncEnabled, &r.ElevenLabsSkillsSyncEnabled, &r.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &AgentConfigRecord{
-			Name:               "default",
-			Mode:               "cascaded",
-			STTModel:           "whisper-1",
-			LLMModel:           "gpt-4o",
-			TTSModel:           "tts-1",
-			TTSVoice:           "alloy",
-			EmbeddingModel:     "text-embedding-3-small",
-			EmbeddingDim:       1536,
-			RAGTopK:            5,
-			RAGMinSimilarity:   0.35,
-			AudioFocusEnabled:  true,
-			AssistantName:      agent.DefaultAssistantName,
-			WakeAliases:        []string{},
-			SpeechProvider:     "local",
-			ElevenLabsSTTModel: "scribe_v3",
-			ElevenLabsTTSModel: "eleven_flash_v2_5",
+			Name:                        "default",
+			Mode:                        "cascaded",
+			STTModel:                    "whisper-1",
+			LLMModel:                    "gpt-4o",
+			TTSModel:                    "tts-1",
+			TTSVoice:                    "alloy",
+			EmbeddingModel:              "text-embedding-3-small",
+			EmbeddingDim:                1536,
+			RAGTopK:                     5,
+			RAGMinSimilarity:            0.35,
+			AudioFocusEnabled:           true,
+			AssistantName:               agent.DefaultAssistantName,
+			WakeAliases:                 []string{},
+			SpeechProvider:              "local",
+			ElevenLabsSTTModel:          "scribe_v3",
+			ElevenLabsTTSModel:          "eleven_flash_v2_5",
+			ElevenLabsRAGSyncEnabled:    true,
+			ElevenLabsSkillsSyncEnabled: true,
 		}, nil
 	}
 	if err != nil {
@@ -169,7 +212,7 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 		return err
 	}
 	provider := normalizeSpeechProvider(rec.SpeechProvider)
-	if provider == "elevenlabs" {
+	if rec.Mode == "cascaded" && provider == "elevenlabs" {
 		var voice string
 		if err := tx.QueryRow(ctx, `
 			SELECT elevenlabs_voice
@@ -191,9 +234,10 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			rag_top_k, rag_min_similarity, audio_focus_enabled,
 			assistant_name, wake_aliases, speech_provider,
 			elevenlabs_stt_model, elevenlabs_tts_model,
-			elevenlabs_api_key_ciphertext, elevenlabs_api_key_last5, updated_at
+			elevenlabs_api_key_ciphertext, elevenlabs_api_key_last5, elevenlabs_agent_id,
+			elevenlabs_rag_sync_enabled, elevenlabs_agent_skills_sync_enabled, updated_at
 		) VALUES (
-			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, NOW()
+			'default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, NOW()
 		)
 		ON CONFLICT (name) DO UPDATE SET
 			mode = EXCLUDED.mode,
@@ -222,6 +266,9 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 			elevenlabs_tts_model = EXCLUDED.elevenlabs_tts_model,
 			elevenlabs_api_key_ciphertext = COALESCE(EXCLUDED.elevenlabs_api_key_ciphertext, agent_configs.elevenlabs_api_key_ciphertext),
 			elevenlabs_api_key_last5 = CASE WHEN EXCLUDED.elevenlabs_api_key_last5 <> '' THEN EXCLUDED.elevenlabs_api_key_last5 ELSE agent_configs.elevenlabs_api_key_last5 END,
+			elevenlabs_agent_id = EXCLUDED.elevenlabs_agent_id,
+			elevenlabs_rag_sync_enabled = EXCLUDED.elevenlabs_rag_sync_enabled,
+			elevenlabs_agent_skills_sync_enabled = EXCLUDED.elevenlabs_agent_skills_sync_enabled,
 			updated_at = NOW()
 		RETURNING id::text, updated_at
 	`,
@@ -233,7 +280,8 @@ func (s *PGAdminStore) UpsertAgentConfig(ctx context.Context, rec *AgentConfigRe
 		rec.RAGTopK, rec.RAGMinSimilarity, rec.AudioFocusEnabled,
 		assistantName, wakeAliases, provider,
 		normalizeElevenLabsSTTModel(rec.ElevenLabsSTTModel), normalizeElevenLabsTTSModel(rec.ElevenLabsTTSModel),
-		rec.ElevenLabsAPIKeyCiphertext, rec.ElevenLabsAPIKeyLast5,
+		rec.ElevenLabsAPIKeyCiphertext, rec.ElevenLabsAPIKeyLast5, rec.ElevenLabsAgentID,
+		rec.ElevenLabsRAGSyncEnabled, rec.ElevenLabsSkillsSyncEnabled,
 	).Scan(&rec.ID, &rec.UpdatedAt)
 	if err != nil {
 		return err
@@ -265,7 +313,9 @@ func normalizeElevenLabsTTSModel(model string) string {
 func (s *PGAdminStore) ListMCPServers(ctx context.Context) ([]MCPServerRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4,
-		       enabled, allowed_tools, discovered_tools, timeout_ms, created_at, updated_at
+		       enabled, allowed_tools, discovered_tools, timeout_ms, created_at, updated_at,
+		       hosted_mode, hosted_resource_id, hosted_agent_id, hosted_sync_status, hosted_sync_error,
+		       hosted_proxy_credential, hosted_creation_intent_id, hosted_creation_config, hosted_creation_attempted
 		FROM mcp_servers ORDER BY created_at ASC
 	`)
 	if err != nil {
@@ -280,10 +330,14 @@ func (s *PGAdminStore) ListMCPServers(ctx context.Context) ([]MCPServerRecord, e
 		if err := rows.Scan(
 			&m.ID, &m.Name, &m.Transport, &m.EndpointURL, &m.AuthHeaderCiphertext, &m.AuthHeaderLast4,
 			&m.Enabled, &m.AllowedTools, &toolsJSON, &m.TimeoutMs, &m.CreatedAt, &m.UpdatedAt,
+			&m.HostedMode, &m.HostedResourceID, &m.HostedAgentID, &m.HostedSyncStatus, &m.HostedSyncError,
+			&m.HostedProxyCredential, &m.HostedCreationIntentID, &m.HostedCreationConfig, &m.HostedCreationAttempted,
 		); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(toolsJSON, &m.DiscoveredTools)
+		if err := json.Unmarshal(toolsJSON, &m.DiscoveredTools); err != nil {
+			return nil, err
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -294,11 +348,15 @@ func (s *PGAdminStore) GetMCPServer(ctx context.Context, id string) (*MCPServerR
 	var toolsJSON []byte
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4,
-		       enabled, allowed_tools, discovered_tools, timeout_ms, created_at, updated_at
+		       enabled, allowed_tools, discovered_tools, timeout_ms, created_at, updated_at,
+		       hosted_mode, hosted_resource_id, hosted_agent_id, hosted_sync_status, hosted_sync_error,
+		       hosted_proxy_credential, hosted_creation_intent_id, hosted_creation_config, hosted_creation_attempted
 		FROM mcp_servers WHERE id = $1::uuid
 	`, id).Scan(
 		&m.ID, &m.Name, &m.Transport, &m.EndpointURL, &m.AuthHeaderCiphertext, &m.AuthHeaderLast4,
 		&m.Enabled, &m.AllowedTools, &toolsJSON, &m.TimeoutMs, &m.CreatedAt, &m.UpdatedAt,
+		&m.HostedMode, &m.HostedResourceID, &m.HostedAgentID, &m.HostedSyncStatus, &m.HostedSyncError,
+		&m.HostedProxyCredential, &m.HostedCreationIntentID, &m.HostedCreationConfig, &m.HostedCreationAttempted,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -306,12 +364,18 @@ func (s *PGAdminStore) GetMCPServer(ctx context.Context, id string) (*MCPServerR
 	if err != nil {
 		return nil, err
 	}
-	_ = json.Unmarshal(toolsJSON, &m.DiscoveredTools)
+	if err := json.Unmarshal(toolsJSON, &m.DiscoveredTools); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
 func (s *PGAdminStore) UpsertMCPServer(ctx context.Context, rec *MCPServerRecord) (*MCPServerRecord, error) {
-	toolsJSON, _ := json.Marshal(rec.DiscoveredTools)
+	normalizeHostedMCP(rec)
+	toolsJSON, err := json.Marshal(rec.DiscoveredTools)
+	if err != nil {
+		return nil, err
+	}
 	if len(toolsJSON) == 0 {
 		toolsJSON = []byte("[]")
 	}
@@ -320,23 +384,32 @@ func (s *PGAdminStore) UpsertMCPServer(ctx context.Context, rec *MCPServerRecord
 	}
 	if rec.ID == "" {
 		err := s.pool.QueryRow(ctx, `
-			INSERT INTO mcp_servers (name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4, enabled, allowed_tools, discovered_tools, timeout_ms)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+			INSERT INTO mcp_servers (name, transport, endpoint_url, auth_header_ciphertext, auth_header_last4, enabled, allowed_tools, discovered_tools, timeout_ms,
+			    hosted_mode, hosted_resource_id, hosted_agent_id, hosted_sync_status, hosted_sync_error, hosted_proxy_credential,
+			    hosted_creation_intent_id, hosted_creation_config, hosted_creation_attempted)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			RETURNING id::text, created_at, updated_at
-		`, rec.Name, rec.Transport, rec.EndpointURL, rec.AuthHeaderCiphertext, rec.AuthHeaderLast4, rec.Enabled, rec.AllowedTools, string(toolsJSON), rec.TimeoutMs).
+		`, rec.Name, rec.Transport, rec.EndpointURL, rec.AuthHeaderCiphertext, rec.AuthHeaderLast4, rec.Enabled, rec.AllowedTools, string(toolsJSON), rec.TimeoutMs,
+			rec.HostedMode, rec.HostedResourceID, rec.HostedAgentID, rec.HostedSyncStatus, rec.HostedSyncError, rec.HostedProxyCredential,
+			rec.HostedCreationIntentID, rec.HostedCreationConfig, rec.HostedCreationAttempted).
 			Scan(&rec.ID, &rec.CreatedAt, &rec.UpdatedAt)
 		return rec, err
 	}
 
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		UPDATE mcp_servers SET
 			name = $2, transport = $3, endpoint_url = $4,
-			auth_header_ciphertext = COALESCE($5, auth_header_ciphertext),
-			auth_header_last4 = CASE WHEN $6 <> '' THEN $6 ELSE auth_header_last4 END,
-			enabled = $7, allowed_tools = $8, discovered_tools = $9::jsonb, timeout_ms = $10, updated_at = NOW()
+			auth_header_ciphertext = $5,
+			auth_header_last4 = $6,
+			enabled = $7, allowed_tools = $8, discovered_tools = $9::jsonb, timeout_ms = $10, updated_at = NOW(),
+			hosted_mode = $11, hosted_resource_id = $12, hosted_agent_id = $13, hosted_sync_status = $14,
+			hosted_sync_error = $15, hosted_proxy_credential = $16, hosted_creation_intent_id = $17,
+			hosted_creation_config = $18, hosted_creation_attempted = $19
 		WHERE id = $1::uuid
 		RETURNING created_at, updated_at
-	`, rec.ID, rec.Name, rec.Transport, rec.EndpointURL, rec.AuthHeaderCiphertext, rec.AuthHeaderLast4, rec.Enabled, rec.AllowedTools, string(toolsJSON), rec.TimeoutMs).
+	`, rec.ID, rec.Name, rec.Transport, rec.EndpointURL, rec.AuthHeaderCiphertext, rec.AuthHeaderLast4, rec.Enabled, rec.AllowedTools, string(toolsJSON), rec.TimeoutMs,
+		rec.HostedMode, rec.HostedResourceID, rec.HostedAgentID, rec.HostedSyncStatus, rec.HostedSyncError, rec.HostedProxyCredential,
+		rec.HostedCreationIntentID, rec.HostedCreationConfig, rec.HostedCreationAttempted).
 		Scan(&rec.CreatedAt, &rec.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

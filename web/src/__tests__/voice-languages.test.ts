@@ -22,7 +22,9 @@ const catalog: LanguageCatalogItem[] = [
 
 describe("voice-languages helpers", () => {
   it("adds a catalog language once and filters it from available options", () => {
-    const initial: VoiceLanguage[] = [{ code: "en", name: "English", voice: "af_heart" }];
+    const initial: VoiceLanguage[] = [
+      { code: "en", name: "English", voice: "af_heart", elevenLabsVoice: "" },
+    ];
     expect(availableCatalogLanguages(initial, catalog).map((c) => c.code)).toEqual(["zh", "ja"]);
 
     const added = addLanguage(initial, catalog, "ja");
@@ -35,8 +37,8 @@ describe("voice-languages helpers", () => {
 
   it("prevents removing the default language while allowing non-default removal", () => {
     const list: VoiceLanguage[] = [
-      { code: "en", name: "English", voice: "af_heart" },
-      { code: "zh", name: "Mandarin Chinese", voice: "zf_xiaoxiao" },
+      { code: "en", name: "English", voice: "af_heart", elevenLabsVoice: "" },
+      { code: "zh", name: "Mandarin Chinese", voice: "zf_xiaoxiao", elevenLabsVoice: "" },
     ];
     expect(canRemoveLanguage("en", "en")).toBe(false);
     expect(canRemoveLanguage("zh", "en")).toBe(true);

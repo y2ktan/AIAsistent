@@ -30,6 +30,7 @@ async function proxyRequest(
   try {
     const upstream = await fetch(targetUrl, init);
     const respHeaders = new Headers();
+    respHeaders.set("Cache-Control", "no-store");
     const ct = upstream.headers.get("content-type");
     if (ct) respHeaders.set("content-type", ct);
 
@@ -47,6 +48,7 @@ async function proxyRequest(
     });
   } catch {
     const respHeaders = new Headers({ "content-type": "application/json" });
+    respHeaders.set("Cache-Control", "no-store");
     applySecurityHeaders(respHeaders);
     return new NextResponse(JSON.stringify({ error: "backend unavailable" }), {
       status: 502,

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -25,15 +26,17 @@ import (
 var elevenLabsAdminAPIBaseURL = "https://api.elevenlabs.io"
 
 type Server struct {
-	authSvc      *auth.Service
-	authStore    auth.Store
-	adminStore   AdminStore
-	ragSvc       *rag.Service
-	rtcMgr       *rtc.Manager
-	mcpHost      *mcp.Host
-	vault        *security.Vault
-	allowPrivate bool
-	logger       *slog.Logger
+	authSvc            *auth.Service
+	authStore          auth.Store
+	adminStore         AdminStore
+	ragSvc             *rag.Service
+	rtcMgr             *rtc.Manager
+	mcpHost            *mcp.Host
+	vault              *security.Vault
+	allowPrivate       bool
+	logger             *slog.Logger
+	hostedProxyBaseURL string
+	hostedProxyLimiter *auth.KeyedRateLimiter
 }
 
 func NewServer(
@@ -47,16 +50,21 @@ func NewServer(
 	allowPrivate bool,
 	logger *slog.Logger,
 ) *Server {
+	if mcpHost == nil {
+		mcpHost = mcp.NewHost(allowPrivate)
+	}
 	return &Server{
-		authSvc:      authSvc,
-		authStore:    authStore,
-		adminStore:   adminStore,
-		ragSvc:       ragSvc,
-		rtcMgr:       rtcMgr,
-		mcpHost:      mcpHost,
-		vault:        vault,
-		allowPrivate: allowPrivate,
-		logger:       logger,
+		authSvc:            authSvc,
+		authStore:          authStore,
+		adminStore:         adminStore,
+		ragSvc:             ragSvc,
+		rtcMgr:             rtcMgr,
+		mcpHost:            mcpHost,
+		vault:              vault,
+		allowPrivate:       allowPrivate,
+		logger:             logger,
+		hostedProxyBaseURL: strings.TrimSpace(os.Getenv("HOSTED_MCP_PROXY_BASE_URL")),
+		hostedProxyLimiter: auth.NewKeyedRateLimiter(60.0/60.0, 30),
 	}
 }
 
@@ -69,7 +77,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func decodeStrictJSON(r *http.Request, dst any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
-	return dec.Decode(dst)
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected trailing JSON")
+	}
+	return nil
 }
 
 func (s *Server) audit(ctx context.Context, r *http.Request, action, targetType, targetID, outcome string, meta map[string]any) {
@@ -214,11 +228,72 @@ func (s *Server) HandleUploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), r, "admin.rag.upload", "document", doc.ID, "success", map[string]any{"filename": doc.Filename, "chunks": doc.ChunkCount})
+	if syncErr := s.syncHostedDocumentsIfActive(r.Context()); syncErr != nil {
+		updated, getErr := s.ragSvc.GetDocument(r.Context(), doc.ID)
+		if getErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Document is ready locally, but hosted sync failed and its status could not be loaded.",
+			})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"document": updated,
+			"warning":  "Document is ready locally, but hosted synchronization failed: " + syncErr.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{"document": doc})
+}
+
+func (s *Server) HandleReindexDocument(w http.ResponseWriter, r *http.Request) {
+	docID := r.PathValue("id")
+	if _, err := s.ragSvc.GetDocument(r.Context(), docID); errors.Is(err, rag.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
+		return
+	} else if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load document"})
+		return
+	}
+	embedder, err := s.activeEmbedder(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "embedding provider is not configured"})
+		return
+	}
+	if err := s.ragSvc.Reindex(r.Context(), docID, embedder); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to reindex document"})
+		return
+	}
+	doc, err := s.ragSvc.GetDocument(r.Context(), docID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "document was reindexed but its status could not be loaded"})
+		return
+	}
+	s.audit(r.Context(), r, "admin.rag.reindex", "document", doc.ID, "success", map[string]any{"chunks": doc.ChunkCount})
+	if syncErr := s.syncHostedDocumentsIfActive(r.Context()); syncErr != nil {
+		updated, getErr := s.ragSvc.GetDocument(r.Context(), doc.ID)
+		if getErr == nil {
+			doc = updated
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"document": doc,
+			"warning":  "Document was reindexed locally, but hosted synchronization failed: " + syncErr.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"document": doc})
 }
 
 func (s *Server) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 	docID := r.PathValue("id")
+	doc, err := s.ragSvc.GetDocument(r.Context(), docID)
+	if errors.Is(err, rag.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load document"})
+		return
+	}
 	if err := s.ragSvc.Delete(r.Context(), docID); err != nil {
 		if errors.Is(err, rag.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
@@ -228,6 +303,12 @@ func (s *Server) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), r, "admin.rag.delete", "document", docID, "success", nil)
+	if err := s.deleteTrackedHostedDocument(r.Context(), doc); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "Local document was deleted, but hosted Knowledge Base deletion failed: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -352,6 +433,12 @@ func (s *Server) HandleUploadAgentSkill(w http.ResponseWriter, r *http.Request) 
 		"filename":     saved.Filename,
 		"sizeBytes":    saved.SizeBytes,
 	})
+	if err := s.syncHostedPromptIfActive(r.Context()); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "Agent Skill was saved, but hosted prompt synchronization failed: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{"skill": toAdminAgentSkillResponse(*saved)})
 }
 
@@ -373,6 +460,12 @@ func (s *Server) HandleUpdateAgentSkill(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.audit(r.Context(), r, "admin.skill.update", "agent_skill", skill.ID, "success", map[string]any{"enabled": skill.Enabled})
+	if err := s.syncHostedPromptIfActive(r.Context()); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "Agent Skill was updated, but hosted prompt synchronization failed: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"skill": toAdminAgentSkillResponse(*skill)})
 }
 
@@ -386,6 +479,12 @@ func (s *Server) HandleDeleteAgentSkill(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.audit(r.Context(), r, "admin.skill.delete", "agent_skill", id, "success", nil)
+	if err := s.syncHostedPromptIfActive(r.Context()); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": "Agent Skill was deleted, but hosted prompt synchronization failed: " + err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -442,6 +541,32 @@ func (s *Server) HandleGetAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	normalizeAgentConfigDefaults(cfg)
 	writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+}
+
+func (s *Server) HandleSyncHostedAgent(w http.ResponseWriter, r *http.Request) {
+	s.withHostedMCPAdmin(w, r, func(locked *Server, r *http.Request) { locked.syncHostedAgent(w, r) })
+}
+
+func (s *Server) syncHostedAgent(w http.ResponseWriter, r *http.Request) {
+	config, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load hosted configuration"})
+		return
+	}
+	if config == nil || config.Mode != "elevenlabs_agent" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "hosted mode must be active before synchronization"})
+		return
+	}
+	if err := s.syncHostedResources(r.Context(), config); err != nil {
+		writeJSON(w, hostedErrorStatus(err), map[string]string{"error": err.Error()})
+		return
+	}
+	documents, err := s.ragSvc.List(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "hosted sync completed but document status could not be loaded"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "synced", "documents": documents})
 }
 
 func (s *Server) HandleDiscoverTTSVoices(w http.ResponseWriter, r *http.Request) {
@@ -536,9 +661,9 @@ func (s *Server) HandleDiscoverTTSVoices(w http.ResponseWriter, r *http.Request)
 						return
 					}
 					var models []struct {
-						ID          string `json:"model_id"`
-						Name        string `json:"name"`
-						CanDoTTS    bool   `json:"can_do_text_to_speech"`
+						ID       string `json:"model_id"`
+						Name     string `json:"name"`
+						CanDoTTS bool   `json:"can_do_text_to_speech"`
 					}
 					if json.NewDecoder(io.LimitReader(modelResp.Body, 8<<20)).Decode(&models) != nil {
 						return
@@ -560,10 +685,10 @@ func (s *Server) HandleDiscoverTTSVoices(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"voices":      voices,
+			"voices":       voices,
 			"voiceOptions": options,
 			"modelOptions": modelOptions,
-			"supported":   len(voices) > 0,
+			"supported":    len(voices) > 0,
 		})
 		return
 	}
@@ -738,86 +863,99 @@ func whisperModelPriority(model string) int {
 }
 
 func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {
+	s.withHostedMCPAdmin(w, r, func(locked *Server, r *http.Request) { locked.updateAgentConfig(w, r) })
+}
+
+func (s *Server) updateAgentConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Mode               string    `json:"mode"`
-		RealtimeWSURL      string    `json:"realtimeWsUrl"`
-		RealtimeModel      string    `json:"realtimeModel"`
-		STTBaseURL         string    `json:"sttBaseUrl"`
-		STTModel           string    `json:"sttModel"`
-		LLMBaseURL         string    `json:"llmBaseUrl"`
-		LLMModel           string    `json:"llmModel"`
-		TTSBaseURL         string    `json:"ttsBaseUrl"`
-		TTSModel           string    `json:"ttsModel"`
-		TTSVoice           string    `json:"ttsVoice"`
-		EmbeddingBaseURL   string    `json:"embeddingBaseUrl"`
-		EmbeddingModel     string    `json:"embeddingModel"`
-		EmbeddingDim       int       `json:"embeddingDim"`
-		SystemInstructions string    `json:"systemInstructions"`
-		APIKey             string    `json:"apiKey"`
-		RAGTopK            int       `json:"ragTopK"`
-		RAGMinSimilarity   float64   `json:"ragMinSimilarity"`
-		AudioFocusEnabled  *bool     `json:"audioFocusEnabled"`
-		AssistantName      *string   `json:"assistantName"`
-		WakeAliases        *[]string `json:"wakeAliases"`
-		SpeechProvider     string    `json:"speechProvider"`
-		ElevenLabsSTTModel string    `json:"elevenLabsSttModel"`
-		ElevenLabsTTSModel string    `json:"elevenLabsTtsModel"`
-		ElevenLabsAPIKey   string    `json:"elevenLabsApiKey"`
+		Mode                        string    `json:"mode"`
+		RealtimeWSURL               *string   `json:"realtimeWsUrl"`
+		RealtimeModel               *string   `json:"realtimeModel"`
+		STTBaseURL                  *string   `json:"sttBaseUrl"`
+		STTModel                    *string   `json:"sttModel"`
+		LLMBaseURL                  *string   `json:"llmBaseUrl"`
+		LLMModel                    *string   `json:"llmModel"`
+		TTSBaseURL                  *string   `json:"ttsBaseUrl"`
+		TTSModel                    *string   `json:"ttsModel"`
+		TTSVoice                    *string   `json:"ttsVoice"`
+		EmbeddingBaseURL            *string   `json:"embeddingBaseUrl"`
+		EmbeddingModel              *string   `json:"embeddingModel"`
+		EmbeddingDim                *int      `json:"embeddingDim"`
+		SystemInstructions          *string   `json:"systemInstructions"`
+		APIKey                      string    `json:"apiKey"`
+		RAGTopK                     *int      `json:"ragTopK"`
+		RAGMinSimilarity            *float64  `json:"ragMinSimilarity"`
+		AudioFocusEnabled           *bool     `json:"audioFocusEnabled"`
+		AssistantName               *string   `json:"assistantName"`
+		WakeAliases                 *[]string `json:"wakeAliases"`
+		SpeechProvider              string    `json:"speechProvider"`
+		ElevenLabsSTTModel          string    `json:"elevenLabsSttModel"`
+		ElevenLabsTTSModel          string    `json:"elevenLabsTtsModel"`
+		ElevenLabsAPIKey            string    `json:"elevenLabsApiKey"`
+		ElevenLabsAgentID           *string   `json:"elevenLabsAgentId"`
+		ElevenLabsRAGSyncEnabled    *bool     `json:"elevenLabsRagSyncEnabled"`
+		ElevenLabsSkillsSyncEnabled *bool     `json:"elevenLabsAgentSkillsSyncEnabled"`
 	}
 	if err := decodeStrictJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
 		return
 	}
-	if req.Mode != "realtime" && req.Mode != "cascaded" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be realtime or cascaded"})
+	if req.Mode != "realtime" && req.Mode != "cascaded" && req.Mode != "elevenlabs_agent" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be realtime, cascaded, or elevenlabs_agent"})
 		return
 	}
 
 	policy := security.SSRFPolicy{AllowPrivate: s.allowPrivate}
-	for _, u := range []string{req.STTBaseURL, req.LLMBaseURL, req.TTSBaseURL, req.EmbeddingBaseURL} {
-		if strings.TrimSpace(u) != "" {
-			if _, err := policy.ValidateHTTPURL(u); err != nil {
+	for _, u := range []*string{req.STTBaseURL, req.LLMBaseURL, req.TTSBaseURL, req.EmbeddingBaseURL} {
+		if u != nil && strings.TrimSpace(*u) != "" {
+			if _, err := policy.ValidateHTTPURL(*u); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or blocked endpoint URL"})
 				return
 			}
 		}
 	}
-	if strings.TrimSpace(req.RealtimeWSURL) != "" {
-		if _, err := policy.ValidateWebSocketURL(req.RealtimeWSURL); err != nil {
+	if req.RealtimeWSURL != nil && strings.TrimSpace(*req.RealtimeWSURL) != "" {
+		if _, err := policy.ValidateWebSocketURL(*req.RealtimeWSURL); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or blocked realtime URL"})
 			return
 		}
 	}
 
-	rec := &AgentConfigRecord{
-		Name:               "default",
-		Mode:               req.Mode,
-		RealtimeWSURL:      req.RealtimeWSURL,
-		RealtimeModel:      req.RealtimeModel,
-		STTBaseURL:         req.STTBaseURL,
-		STTModel:           req.STTModel,
-		LLMBaseURL:         req.LLMBaseURL,
-		LLMModel:           req.LLMModel,
-		TTSBaseURL:         req.TTSBaseURL,
-		TTSModel:           req.TTSModel,
-		TTSVoice:           req.TTSVoice,
-		EmbeddingBaseURL:   req.EmbeddingBaseURL,
-		EmbeddingModel:     req.EmbeddingModel,
-		EmbeddingDim:       req.EmbeddingDim,
-		SystemInstructions: req.SystemInstructions,
-		RAGTopK:            req.RAGTopK,
-		RAGMinSimilarity:   req.RAGMinSimilarity,
-		SpeechProvider:     normalizeSpeechProvider(req.SpeechProvider),
-		ElevenLabsSTTModel: normalizeElevenLabsSTTModel(req.ElevenLabsSTTModel),
-		ElevenLabsTTSModel: normalizeElevenLabsTTSModel(req.ElevenLabsTTSModel),
-	}
-	if rec.EmbeddingDim <= 0 {
-		rec.EmbeddingDim = 1536
-	}
 	existing, err := s.adminStore.GetAgentConfig(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load agent config"})
 		return
+	}
+	previous := AgentConfigRecord{ElevenLabsRAGSyncEnabled: true, ElevenLabsSkillsSyncEnabled: true}
+	if existing != nil {
+		previous = *existing
+	}
+	rec := &AgentConfigRecord{
+		Name:                        "default",
+		Mode:                        req.Mode,
+		RealtimeWSURL:               updatedConfigValue(req.RealtimeWSURL, previous.RealtimeWSURL),
+		RealtimeModel:               updatedConfigValue(req.RealtimeModel, previous.RealtimeModel),
+		STTBaseURL:                  updatedConfigValue(req.STTBaseURL, previous.STTBaseURL),
+		STTModel:                    updatedConfigValue(req.STTModel, previous.STTModel),
+		LLMBaseURL:                  updatedConfigValue(req.LLMBaseURL, previous.LLMBaseURL),
+		LLMModel:                    updatedConfigValue(req.LLMModel, previous.LLMModel),
+		TTSBaseURL:                  updatedConfigValue(req.TTSBaseURL, previous.TTSBaseURL),
+		TTSModel:                    updatedConfigValue(req.TTSModel, previous.TTSModel),
+		TTSVoice:                    updatedConfigValue(req.TTSVoice, previous.TTSVoice),
+		EmbeddingBaseURL:            updatedConfigValue(req.EmbeddingBaseURL, previous.EmbeddingBaseURL),
+		EmbeddingModel:              updatedConfigValue(req.EmbeddingModel, previous.EmbeddingModel),
+		EmbeddingDim:                updatedConfigValue(req.EmbeddingDim, previous.EmbeddingDim),
+		SystemInstructions:          updatedConfigValue(req.SystemInstructions, previous.SystemInstructions),
+		RAGTopK:                     updatedConfigValue(req.RAGTopK, previous.RAGTopK),
+		RAGMinSimilarity:            updatedConfigValue(req.RAGMinSimilarity, previous.RAGMinSimilarity),
+		SpeechProvider:              normalizeSpeechProvider(req.SpeechProvider),
+		ElevenLabsSTTModel:          normalizeElevenLabsSTTModel(req.ElevenLabsSTTModel),
+		ElevenLabsTTSModel:          normalizeElevenLabsTTSModel(req.ElevenLabsTTSModel),
+		ElevenLabsRAGSyncEnabled:    updatedConfigValue(req.ElevenLabsRAGSyncEnabled, previous.ElevenLabsRAGSyncEnabled),
+		ElevenLabsSkillsSyncEnabled: updatedConfigValue(req.ElevenLabsSkillsSyncEnabled, previous.ElevenLabsSkillsSyncEnabled),
+	}
+	if rec.EmbeddingDim <= 0 {
+		rec.EmbeddingDim = 1536
 	}
 	if strings.TrimSpace(req.ElevenLabsAPIKey) != "" {
 		key := strings.TrimSpace(req.ElevenLabsAPIKey)
@@ -834,6 +972,30 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		rec.ElevenLabsAPIKeyLast5 = maskLast5(key)
 	}
 	if existing != nil {
+		rec.ElevenLabsAgentID = existing.ElevenLabsAgentID
+		if existing != nil && (rec.ElevenLabsAgentID != existing.ElevenLabsAgentID || req.ElevenLabsAPIKey != "") {
+			servers, err := s.adminStore.ListMCPServers(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not check hosted MCP ownership before changing agents."})
+				return
+			}
+			for _, server := range servers {
+				if server.HostedResourceID != "" || server.HostedCreationAttempted {
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "Disable and verify cleanup of hosted MCP integrations before changing the ElevenLabs agent or key."})
+					return
+				}
+			}
+		}
+		if rec.Mode == "elevenlabs_agent" {
+			rec.RealtimeWSURL, rec.RealtimeModel = existing.RealtimeWSURL, existing.RealtimeModel
+			rec.STTBaseURL, rec.STTModel = existing.STTBaseURL, existing.STTModel
+			rec.LLMBaseURL, rec.LLMModel = existing.LLMBaseURL, existing.LLMModel
+			rec.TTSBaseURL, rec.TTSModel, rec.TTSVoice = existing.TTSBaseURL, existing.TTSModel, existing.TTSVoice
+			rec.EmbeddingBaseURL, rec.EmbeddingModel, rec.EmbeddingDim = existing.EmbeddingBaseURL, existing.EmbeddingModel, existing.EmbeddingDim
+			rec.RAGTopK, rec.RAGMinSimilarity = existing.RAGTopK, existing.RAGMinSimilarity
+			rec.SpeechProvider = existing.SpeechProvider
+			rec.ElevenLabsSTTModel, rec.ElevenLabsTTSModel = existing.ElevenLabsSTTModel, existing.ElevenLabsTTSModel
+		}
 		if rec.ElevenLabsAPIKeyLast5 == "" {
 			rec.ElevenLabsAPIKeyLast5 = existing.ElevenLabsAPIKeyLast5
 		}
@@ -847,7 +1009,14 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 			rec.ElevenLabsTTSModel = normalizeElevenLabsTTSModel(existing.ElevenLabsTTSModel)
 		}
 	}
-	if rec.SpeechProvider == "elevenlabs" {
+	if req.ElevenLabsAgentID != nil {
+		rec.ElevenLabsAgentID = strings.TrimSpace(*req.ElevenLabsAgentID)
+		if len(rec.ElevenLabsAgentID) > 128 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ElevenLabs agent ID is too long"})
+			return
+		}
+	}
+	if rec.Mode == "cascaded" && rec.SpeechProvider == "elevenlabs" {
 		hasKey := len(rec.ElevenLabsAPIKeyCiphertext) > 0 || (existing != nil && len(existing.ElevenLabsAPIKeyCiphertext) > 0)
 		if !hasKey {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "configure an ElevenLabs API key before selecting ElevenLabs"})
@@ -918,19 +1087,44 @@ func (s *Server) HandleUpdateAgentConfig(w http.ResponseWriter, r *http.Request)
 		rec.APIKeyLast4 = security.MaskLast4(req.APIKey)
 	}
 
+	if rec.Mode == "elevenlabs_agent" {
+		candidate := *rec
+		if len(candidate.ElevenLabsAPIKeyCiphertext) == 0 && existing != nil {
+			candidate.ElevenLabsAPIKeyCiphertext = existing.ElevenLabsAPIKeyCiphertext
+		}
+		if !candidate.ElevenLabsRAGSyncEnabled {
+			if err := s.cleanupDisabledHostedRAG(r.Context(), &candidate); err != nil {
+				writeJSON(w, hostedErrorStatus(err), map[string]string{"error": err.Error()})
+				return
+			}
+		}
+		if err := s.syncHostedResources(r.Context(), &candidate); err != nil {
+			writeJSON(w, hostedErrorStatus(err), map[string]string{"error": err.Error()})
+			return
+		}
+	}
 	if err := s.adminStore.UpsertAgentConfig(r.Context(), rec); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save agent config"})
 		return
 	}
 	s.audit(r.Context(), r, "admin.agent_config.update", "agent_config", rec.ID, "success", map[string]any{
-		"mode":              rec.Mode,
-		"audioFocusEnabled": rec.AudioFocusEnabled,
-		"assistantName":     rec.AssistantName,
-		"wakeAliases":       rec.WakeAliases,
-		"speechProvider":    rec.SpeechProvider,
-		"elevenLabsKeySet":  len(rec.ElevenLabsAPIKeyCiphertext) > 0 || (existing != nil && len(existing.ElevenLabsAPIKeyCiphertext) > 0),
+		"mode":                             rec.Mode,
+		"audioFocusEnabled":                rec.AudioFocusEnabled,
+		"assistantName":                    rec.AssistantName,
+		"wakeAliases":                      rec.WakeAliases,
+		"speechProvider":                   rec.SpeechProvider,
+		"elevenLabsRagSyncEnabled":         rec.ElevenLabsRAGSyncEnabled,
+		"elevenLabsAgentSkillsSyncEnabled": rec.ElevenLabsSkillsSyncEnabled,
+		"elevenLabsKeySet":                 len(rec.ElevenLabsAPIKeyCiphertext) > 0 || (existing != nil && len(existing.ElevenLabsAPIKeyCiphertext) > 0),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"config": rec})
+}
+
+func updatedConfigValue[T any](value *T, previous T) T {
+	if value != nil {
+		return *value
+	}
+	return previous
 }
 
 func (s *Server) effectiveVoiceLanguages(ctx context.Context) (agent.VoiceLanguageSettings, bool, error) {
@@ -1052,6 +1246,41 @@ func (s *Server) HandleTestAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load config"})
 		return
 	}
+	var candidate struct {
+		Mode    string  `json:"mode"`
+		AgentID *string `json:"elevenLabsAgentId"`
+		Key     string  `json:"elevenLabsApiKey"`
+	}
+	if err := decodeStrictJSON(r, &candidate); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid test configuration"})
+		return
+	}
+	if candidate.Mode != "" {
+		if candidate.Mode != "elevenlabs_agent" && candidate.Mode != "cascaded" && candidate.Mode != "realtime" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid conversation mode"})
+			return
+		}
+		cfg.Mode = candidate.Mode
+	}
+	if cfg.Mode == "elevenlabs_agent" {
+		if candidate.AgentID != nil {
+			cfg.ElevenLabsAgentID = strings.TrimSpace(*candidate.AgentID)
+		}
+		if key := strings.TrimSpace(candidate.Key); key != "" {
+			if len(key) <= 5 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ElevenLabs API key is too short"})
+				return
+			}
+			ciphertext, err := s.vault.Encrypt(key)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not prepare the ElevenLabs credential."})
+				return
+			}
+			cfg.ElevenLabsAPIKeyCiphertext = ciphertext
+		}
+		s.testHostedConfig(w, r, cfg)
+		return
+	}
 	target := cfg.LLMBaseURL
 	if cfg.Mode == "realtime" && cfg.RealtimeWSURL != "" {
 		target = cfg.RealtimeWSURL
@@ -1094,20 +1323,16 @@ func (s *Server) HandleListMCPServers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list mcp servers"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"servers": servers})
+	for i := range servers {
+		normalizeHostedMCP(&servers[i])
+	}
+	_, proxyErr := hostedPublicHTTPS(s.hostedProxyBaseURL, true)
+	writeJSON(w, http.StatusOK, map[string]any{"servers": servers, "hostedProxyAvailable": proxyErr == nil})
 }
 
 func (s *Server) HandleUpsertMCPServer(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var req struct {
-		Name         string   `json:"name"`
-		Transport    string   `json:"transport"`
-		EndpointURL  string   `json:"endpointUrl"`
-		AuthHeader   string   `json:"authHeader"`
-		Enabled      bool     `json:"enabled"`
-		AllowedTools []string `json:"allowedTools"`
-		TimeoutMs    int      `json:"timeoutMs"`
-	}
+	var req hostedMCPAdminRequest
 	if err := decodeStrictJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
 		return
@@ -1133,26 +1358,16 @@ func (s *Server) HandleUpsertMCPServer(w http.ResponseWriter, r *http.Request) {
 	if rec.TimeoutMs <= 0 {
 		rec.TimeoutMs = 10000
 	}
-	if strings.TrimSpace(req.AuthHeader) != "" {
-		ct, err := s.vault.Encrypt(req.AuthHeader)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt auth header"})
-			return
-		}
-		rec.AuthHeaderCiphertext = ct
-		rec.AuthHeaderLast4 = security.MaskLast4(req.AuthHeader)
-	}
-
-	saved, err := s.adminStore.UpsertMCPServer(r.Context(), rec)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save mcp server"})
-		return
-	}
-	s.audit(r.Context(), r, "admin.mcp.upsert", "mcp_server", saved.ID, "success", map[string]any{"name": saved.Name, "enabled": saved.Enabled})
-	writeJSON(w, http.StatusOK, map[string]any{"server": saved})
+	s.withHostedMCPAdmin(w, r, func(locked *Server, r *http.Request) {
+		locked.saveHostedMCP(w, r, rec, req)
+	})
 }
 
 func (s *Server) HandleDiscoverMCPServer(w http.ResponseWriter, r *http.Request) {
+	s.withHostedMCPAdmin(w, r, func(locked *Server, r *http.Request) { locked.discoverHostedMCP(w, r) })
+}
+
+func (s *Server) discoverHostedMCP(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	srv, err := s.adminStore.GetMCPServer(r.Context(), id)
 	if err != nil {
@@ -1161,7 +1376,11 @@ func (s *Server) HandleDiscoverMCPServer(w http.ResponseWriter, r *http.Request)
 	}
 	var authHdr string
 	if len(srv.AuthHeaderCiphertext) > 0 {
-		authHdr, _ = s.vault.Decrypt(srv.AuthHeaderCiphertext)
+		authHdr, err = s.vault.Decrypt(srv.AuthHeaderCiphertext)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not load MCP authentication."})
+			return
+		}
 	}
 	tools, err := s.mcpHost.DiscoverTools(r.Context(), mcp.ServerConfig{
 		ID:          srv.ID,
@@ -1177,22 +1396,23 @@ func (s *Server) HandleDiscoverMCPServer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	srv.DiscoveredTools = tools
+	if srv.HostedMode != "disabled" {
+		srv.HostedSyncStatus = "pending"
+	}
 	updated, err := s.adminStore.UpsertMCPServer(r.Context(), srv)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save discovered tools"})
+		return
+	}
+	if err := s.syncChangedHostedMCP(r.Context(), updated); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"server": updated, "error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"server": updated, "tools": tools})
 }
 
 func (s *Server) HandleDeleteMCPServer(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if err := s.adminStore.DeleteMCPServer(r.Context(), id); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "mcp server not found"})
-		return
-	}
-	s.audit(r.Context(), r, "admin.mcp.delete", "mcp_server", id, "success", nil)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	s.withHostedMCPAdmin(w, r, func(locked *Server, r *http.Request) { locked.deleteHostedMCP(w, r) })
 }
 
 func (s *Server) HandleListAuditLogs(w http.ResponseWriter, r *http.Request) {
@@ -1214,10 +1434,25 @@ func (s *Server) HandleRTCConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"audioFocusEnabled": cfg.AudioFocusEnabled,
 		"assistantName":     cfg.AssistantName,
+		"mode":              cfg.Mode,
+		"capabilities": map[string]bool{
+			"camera":         cfg.Mode != "elevenlabs_agent",
+			"localKnowledge": cfg.Mode != "elevenlabs_agent",
+			"strictWakeGate": cfg.Mode != "elevenlabs_agent",
+		},
 	})
 }
 
 func (s *Server) HandleRTCOffer(w http.ResponseWriter, r *http.Request) {
+	config, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load voice configuration"})
+		return
+	}
+	if config.Mode == "elevenlabs_agent" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Hosted mode uses a provider conversation token, not backend signaling."})
+		return
+	}
 	var req struct {
 		SignalingToken string `json:"signalingToken"`
 		SDP            string `json:"sdp"`
@@ -1263,6 +1498,11 @@ func (s *Server) attachSessionAgent(ps *rtc.PeerSession) {
 	cfgRec, err := s.adminStore.GetAgentConfig(ctx)
 	if err != nil {
 		ps.SendEvent(rtc.NewErrorEvent("Failed to load AI configuration."))
+		return
+	}
+	if cfgRec.Mode == "elevenlabs_agent" {
+		ps.SendEvent(rtc.NewErrorEvent("Conversation mode changed. End this call and start again."))
+		ps.Close()
 		return
 	}
 	var apiKey string

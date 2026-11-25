@@ -5,7 +5,7 @@ export const SECURITY_HEADERS: Record<string, string> = {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "media-src 'self' blob:",
-    "connect-src 'self' ws: wss:",
+    "connect-src 'self' ws: wss: https://livekit.rtc.elevenlabs.io",
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",

@@ -3,6 +3,8 @@ package rag
 import (
 	"context"
 	"errors"
+	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -43,7 +45,7 @@ func (s *PGStore) UpdateDocumentStatus(ctx context.Context, docID, status, errMs
 	return nil
 }
 
-func (s *PGStore) ReplaceDocumentChunks(ctx context.Context, docID string, chunks []DocumentChunk) error {
+func (s *PGStore) ReplaceDocumentChunks(ctx context.Context, docID string, chunks []DocumentChunk, extractedText string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -66,9 +68,10 @@ func (s *PGStore) ReplaceDocumentChunks(ctx context.Context, docID string, chunk
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE documents
-		SET status = 'ready', error_message = '', chunk_count = $2, updated_at = NOW()
+		SET status = 'ready', error_message = '', chunk_count = $2, extracted_text = $3,
+		    elevenlabs_sync_status = 'not_synced', elevenlabs_sync_error = '', updated_at = NOW()
 		WHERE id = $1::uuid
-	`, docID, len(chunks)); err != nil {
+	`, docID, len(chunks), extractedText); err != nil {
 		return err
 	}
 
@@ -89,11 +92,15 @@ func (s *PGStore) DeleteDocument(ctx context.Context, docID string) error {
 func (s *PGStore) GetDocument(ctx context.Context, docID string) (*Document, error) {
 	d := &Document{}
 	err := s.pool.QueryRow(ctx, `
-		SELECT id::text, title, filename, mime_type, size_bytes, sha256_hash, status, error_message, chunk_count, uploaded_by::text, created_at, updated_at
+		SELECT id::text, title, filename, mime_type, size_bytes, sha256_hash, status, error_message, chunk_count,
+		       uploaded_by::text, extracted_text, elevenlabs_doc_id, elevenlabs_synced_hash, elevenlabs_agent_id,
+		       elevenlabs_sync_status, elevenlabs_sync_error, created_at, updated_at
 		FROM documents WHERE id = $1::uuid
 	`, docID).Scan(
 		&d.ID, &d.Title, &d.Filename, &d.MimeType, &d.SizeBytes, &d.SHA256Hash,
-		&d.Status, &d.ErrorMessage, &d.ChunkCount, &d.UploadedBy, &d.CreatedAt, &d.UpdatedAt,
+		&d.Status, &d.ErrorMessage, &d.ChunkCount, &d.UploadedBy, &d.ExtractedText,
+		&d.ElevenLabsDocID, &d.ElevenLabsSyncedHash, &d.ElevenLabsAgentID,
+		&d.ElevenLabsSyncStatus, &d.ElevenLabsSyncError, &d.CreatedAt, &d.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -103,7 +110,9 @@ func (s *PGStore) GetDocument(ctx context.Context, docID string) (*Document, err
 
 func (s *PGStore) ListDocuments(ctx context.Context) ([]Document, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id::text, title, filename, mime_type, size_bytes, sha256_hash, status, error_message, chunk_count, uploaded_by::text, created_at, updated_at
+		SELECT id::text, title, filename, mime_type, size_bytes, sha256_hash, status, error_message, chunk_count,
+		       uploaded_by::text, elevenlabs_doc_id, elevenlabs_synced_hash, elevenlabs_agent_id,
+		       elevenlabs_sync_status, elevenlabs_sync_error, created_at, updated_at
 		FROM documents ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -116,13 +125,143 @@ func (s *PGStore) ListDocuments(ctx context.Context) ([]Document, error) {
 		var d Document
 		if err := rows.Scan(
 			&d.ID, &d.Title, &d.Filename, &d.MimeType, &d.SizeBytes, &d.SHA256Hash,
-			&d.Status, &d.ErrorMessage, &d.ChunkCount, &d.UploadedBy, &d.CreatedAt, &d.UpdatedAt,
+			&d.Status, &d.ErrorMessage, &d.ChunkCount, &d.UploadedBy, &d.ElevenLabsDocID,
+			&d.ElevenLabsSyncedHash, &d.ElevenLabsAgentID, &d.ElevenLabsSyncStatus,
+			&d.ElevenLabsSyncError, &d.CreatedAt, &d.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
 		docs = append(docs, d)
 	}
 	return docs, rows.Err()
+}
+
+func (s *PGStore) ListReadyDocumentsForHostedSync(ctx context.Context) ([]Document, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT d.id::text, d.title, d.filename, d.mime_type, d.size_bytes, d.sha256_hash, d.status,
+		       d.error_message, d.chunk_count, d.uploaded_by::text, d.extracted_text,
+		       d.elevenlabs_doc_id, d.elevenlabs_synced_hash, d.elevenlabs_agent_id,
+		       d.elevenlabs_sync_status, d.elevenlabs_sync_error, d.created_at, d.updated_at,
+		       COALESCE(dc.chunk_index, -1), COALESCE(dc.content, '')
+		FROM documents d
+		LEFT JOIN document_chunks dc ON dc.document_id = d.id
+		WHERE d.status = 'ready'
+		ORDER BY d.created_at, d.id, dc.chunk_index
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var docs []Document
+	var chunks []DocumentChunk
+	currentID := ""
+	appendCurrent := func() {
+		if len(docs) == 0 {
+			return
+		}
+		if docs[len(docs)-1].ExtractedText == "" {
+			docs[len(docs)-1].ExtractedText = reconstructTextFromChunks(chunks)
+		}
+		chunks = nil
+	}
+
+	for rows.Next() {
+		var d Document
+		var chunkIndex int
+		var content string
+		if err := rows.Scan(
+			&d.ID, &d.Title, &d.Filename, &d.MimeType, &d.SizeBytes, &d.SHA256Hash, &d.Status,
+			&d.ErrorMessage, &d.ChunkCount, &d.UploadedBy, &d.ExtractedText,
+			&d.ElevenLabsDocID, &d.ElevenLabsSyncedHash, &d.ElevenLabsAgentID,
+			&d.ElevenLabsSyncStatus, &d.ElevenLabsSyncError, &d.CreatedAt, &d.UpdatedAt,
+			&chunkIndex, &content,
+		); err != nil {
+			return nil, err
+		}
+		if d.ID != currentID {
+			appendCurrent()
+			docs = append(docs, d)
+			currentID = d.ID
+		}
+		if chunkIndex >= 0 {
+			chunks = append(chunks, DocumentChunk{ChunkIndex: chunkIndex, Content: content})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	appendCurrent()
+	return docs, nil
+}
+
+func (s *PGStore) UpdateElevenLabsSyncState(
+	ctx context.Context,
+	docID, elevenLabsDocID, syncedHash, agentID, status, errMsg string,
+) error {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE documents
+		SET elevenlabs_doc_id = $2, elevenlabs_synced_hash = $3, elevenlabs_agent_id = $4,
+		    elevenlabs_sync_status = $5, elevenlabs_sync_error = $6, updated_at = NOW()
+		WHERE id = $1::uuid
+	`, docID, elevenLabsDocID, syncedHash, agentID, status, errMsg)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func reconstructTextFromChunks(chunks []DocumentChunk) string {
+	if len(chunks) == 0 {
+		return ""
+	}
+	sort.SliceStable(chunks, func(i, j int) bool {
+		return chunks[i].ChunkIndex < chunks[j].ChunkIndex
+	})
+	var result []rune
+	for _, chunk := range chunks {
+		next := []rune(chunk.Content)
+		if len(next) == 0 {
+			continue
+		}
+		if len(result) == 0 {
+			result = append(result, next...)
+			continue
+		}
+		overlap := matchingChunkOverlap(result, next)
+		if overlap == 0 {
+			result = append(result, '\n', '\n')
+		}
+		result = append(result, next[overlap:]...)
+	}
+	return strings.TrimSpace(string(result))
+}
+
+func matchingChunkOverlap(previous, next []rune) int {
+	maxOverlap := 360
+	minOverlap := 320
+	if len(previous) < maxOverlap {
+		maxOverlap = len(previous)
+	}
+	if len(next) < maxOverlap {
+		maxOverlap = len(next)
+	}
+	for overlap := maxOverlap; overlap >= minOverlap; overlap-- {
+		matches := true
+		for i := 0; i < overlap; i++ {
+			if previous[len(previous)-overlap+i] != next[i] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return overlap
+		}
+	}
+	return 0
 }
 
 func (s *PGStore) SearchSimilar(ctx context.Context, queryVec []float32, topK int, minSimilarity float64) ([]RetrievedChunk, error) {

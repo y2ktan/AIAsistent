@@ -18,14 +18,18 @@ The system SHALL allow administrators on `/admin` to create users, assign or upd
 - **THEN** the system rejects the operation with HTTP `409 Conflict` to prevent administrative lockout
 
 ### Requirement: RAG document management workspace
-The system SHALL provide an administrative document panel displaying ingestion status, chunk counts, upload controls, reindex triggers, and deletion actions.
+The system SHALL provide an administrative document panel displaying local ingestion status, chunk counts, upload controls, reindex triggers, and deletion actions, and when an ElevenLabs hosted agent is configured SHALL additionally display per-document hosted Knowledge Base sync status (`synced`, `indexing`, `failed`, or `not_synced`) and a manual hosted-sync/retry trigger.
 
 #### Scenario: Administrator monitors document ingestion progress
 - **WHEN** an administrator uploads one or more documents in `/admin`
 - **THEN** the document table reflects status transitions (`processing`, `ready`, or `failed`) and total indexed chunk count
 
+#### Scenario: Administrator monitors and retries hosted Knowledge Base sync
+- **WHEN** an administrator views `/admin` with a configured hosted agent or triggers a hosted sync retry after an upstream ElevenLabs failure
+- **THEN** the document panel displays each document's hosted sync state without altering its local pgvector status and retries synchronization server-side
+
 ### Requirement: Write-only AI provider key, endpoint, and model configuration
-The system SHALL allow administrators to configure active AI pipeline mode (`realtime` or `cascaded`), provider base URLs, model names (including selecting from discovered speech-to-text models when available, with manual entry fallback), system instructions, and API keys while treating secrets as write-only after submission.
+The system SHALL let administrators configure AI pipeline mode, provider endpoints and models, system instructions, and write-only credentials, with discovered speech-to-text models where available and manual fallback. In hosted mode, the application SHALL synchronize only `assistantName`, `systemInstructions`, enabled Agent Skills, and `ready` local documents; provider model, voice, TTS, and language settings SHALL remain dashboard-owned.
 
 #### Scenario: Administrator updates AI API key and endpoint
 - **WHEN** an administrator saves a new AI provider endpoint and API key
@@ -38,6 +42,36 @@ The system SHALL allow administrators to configure active AI pipeline mode (`rea
 #### Scenario: Administrator tests AI endpoint connectivity
 - **WHEN** an administrator triggers a connection health check for the configured AI provider
 - **THEN** the backend verifies connectivity server-side and returns a sanitized pass/fail status without exposing stored credentials to the browser
+
+#### Scenario: Administrator selects hosted mode
+- **WHEN** an administrator selects `elevenlabs_agent`
+- **THEN** the form offers a private agent ID, the existing write-only ElevenLabs credential, `assistantName`, and `systemInstructions`, identifies which settings synchronize automatically versus remain dashboard-owned, and preserves inactive provider fields
+
+### Requirement: Hosted-agent activation validation and synchronization
+The system SHALL require an agent ID and ElevenLabs credential for hosted activation, validate private authentication plus every workflow and tool reference, and synchronize the application-owned persona, skills, and `ready` documents without requiring inactive local provider settings.
+
+#### Scenario: Complete private agent activated and synchronized
+- **WHEN** an administrator activates a reachable private agent using a valid write-capable ElevenLabs credential and every configured workflow, tool, and MCP reference passes validation
+- **THEN** the server synchronizes the application's prompt/persona, enabled Agent Skills, and `ready` local documents to the hosted agent, enables hosted RAG while preserving unmanaged dashboard documents, and saves `elevenlabs_agent` without changing local voices, language defaults, or provider settings
+
+#### Scenario: Incomplete, incompatible, or non-writable agent
+- **WHEN** an administrator attempts activation with missing credentials, a missing or inaccessible agent, insufficient write permissions, an oversized skill prompt, a public agent, an unsupported workflow, or an unverified external tool
+- **THEN** the save fails with a safe diagnostic and leaves the previous active mode unchanged
+
+#### Scenario: Provider validation unavailable
+- **WHEN** the provider cannot be reached during activation validation or synchronization
+- **THEN** activation fails visibly without treating unavailable validation as success
+
+### Requirement: Hosted ownership and processing disclosure
+Hosted settings SHALL distinguish synchronized application settings from ElevenLabs dashboard-owned settings and disclose cloud processing, potential charges, provider turn-taking, explicitly selected MCP exposure, and absent camera or local citation capabilities.
+
+#### Scenario: Administrator configures hosted mode
+- **WHEN** an administrator opens the hosted-agent settings
+- **THEN** the form displays which settings synchronize automatically versus remain dashboard-owned and hides inapplicable local speech/LLM endpoint controls while preserving their saved values
+
+#### Scenario: Local document operations synchronize when hosted mode is active
+- **WHEN** an administrator uploads, reindexes, or deletes a document in the application's document workspace while `elevenlabs_agent` is active
+- **THEN** the operation updates local pgvector storage and automatically synchronizes the corresponding ElevenLabs Knowledge Base entry while preserving unmanaged dashboard documents
 
 ### Requirement: Audio focus noise-filtering configuration
 The system SHALL enable Audio Focus by default and SHALL allow administrators on `/admin` to enable or disable Audio Focus speaker voice isolation and environmental noise filtering, recording configuration changes in the administrative audit log.
@@ -145,6 +179,36 @@ The system SHALL allow administrators to register, enable, disable, and test Mod
 - **WHEN** an administrator enables or disables a discovered tool with its checkbox
 - **THEN** the system saves the updated allowlist and preserves that server's current discovered-tools visibility
 
+### Requirement: Hosted MCP integration governance
+The administration console SHALL let an administrator explicitly select and review how each application MCP server is exposed to a hosted ElevenLabs agent.
+
+#### Scenario: Hosted integration defaults to disabled
+- **WHEN** an administrator creates or opens an application MCP server that has no hosted integration choice
+- **THEN** the console shows that it is not shared with hosted agents and does not register it with ElevenLabs
+
+#### Scenario: Administrator chooses direct registration
+- **WHEN** an administrator selects direct provider registration for an eligible MCP server
+- **THEN** the console explains that the endpoint and configured authentication material are shared with ElevenLabs and requires confirmation before saving that choice
+
+#### Scenario: Administrator chooses the application proxy
+- **WHEN** an administrator selects the application proxy for an MCP server
+- **THEN** the console explains that ElevenLabs will invoke the application over HTTPS, that the original MCP credential remains in the application, and which allowlisted tools can be called
+
+#### Scenario: Administrator reviews synchronization state
+- **WHEN** the hosted MCP integration is pending, synchronized, or failed
+- **THEN** the console shows that state and a sanitized reason, and does not represent a failed integration as ready for hosted use
+
+#### Scenario: Administrator disables or removes an integration
+- **WHEN** an administrator disables or removes an MCP server's hosted integration
+- **THEN** the console confirms the resulting hosted availability and the system prevents new hosted calls from using that integration
+
+### Requirement: Hosted workflow external-action disclosure
+Before enabling hosted workflows with external tools, the administration console SHALL disclose that provider-executed workflow actions can send conversation-derived data to external services and may cause external side effects.
+
+#### Scenario: Administrator enables a workflow with external actions
+- **WHEN** an administrator saves a hosted configuration containing a supported external workflow action or selected MCP integration
+- **THEN** the console presents the external-processing and side-effect disclosure before the configuration becomes active
+
 ### Requirement: Agent skill governance workspace
 The system SHALL provide a dedicated Agent Skills tab on `/admin` allowing administrators to upload `.md` or `.zip` skill packages, replace an existing skill by name, inspect parsed metadata and instructions, view referenced MCP tool readiness, toggle skill enablement, and delete skills.
 
@@ -166,3 +230,37 @@ The system SHALL record structured audit events for logins, failed authenticatio
 #### Scenario: Configuration change recorded in audit trail
 - **WHEN** an administrator modifies AI credentials, MCP settings, Agent Skills, or user roles
 - **THEN** an append-only audit record capturing actor ID, timestamp, action type, and redacted metadata becomes visible in the audit log view
+
+### Requirement: Independent hosted synchronization controls
+The administration console SHALL provide separate controls for synchronizing local RAG documents and enabled Agent Skills to a hosted ElevenLabs agent, SHALL default both controls to enabled for existing and new configurations, and SHALL show the selected ownership mode and synchronization state independently.
+
+#### Scenario: Administrator disables only RAG synchronization
+- **WHEN** an administrator disables application RAG synchronization while leaving Agent Skill synchronization enabled
+- **THEN** hosted activation no longer uploads or attaches application documents, enabled Agent Skills continue to synchronize, and the console clearly identifies RAG as application-sync disabled
+
+#### Scenario: Administrator disables only Agent Skill synchronization
+- **WHEN** an administrator disables Agent Skill synchronization while leaving application RAG synchronization enabled
+- **THEN** hosted prompt synchronization excludes enabled application skills, local documents continue to synchronize, and the console clearly identifies Agent Skills as application-sync disabled
+
+#### Scenario: Administrator disables both synchronization domains
+- **WHEN** an administrator disables application RAG and Agent Skill synchronization
+- **THEN** the hosted agent can be activated and used with only the independently configured persona and system instructions, without application documents or skills blocking connection
+
+#### Scenario: An existing configuration is upgraded
+- **WHEN** an installation with an existing hosted-agent configuration receives this capability
+- **THEN** both synchronization controls are treated as enabled until an administrator explicitly changes them
+
+#### Scenario: Administrator changes a disabled domain
+- **WHEN** an administrator enables or disables either synchronization control on an active hosted configuration
+- **THEN** the system saves the choice transactionally with hosted compatibility verification and reports any required provider cleanup or synchronization failure without representing the domain as successfully changed
+
+### Requirement: Admin creation and MCP registration forms suppress browser credential autofill
+The system SHALL configure the `/admin` user creation form and MCP server registration form to suppress browser credential autofill so that saved administrator login emails and passwords are not pre-populated into those inputs by default.
+
+#### Scenario: Add User form renders empty without credential autofill
+- **WHEN** an administrator with saved browser credentials opens the Users tab on `/admin`
+- **THEN** the Add User email and password inputs initialize empty and declare autocomplete suppression attributes so the browser does not pre-fill the administrator's saved email or password
+
+#### Scenario: Register MCP form renders empty without credential autofill
+- **WHEN** an administrator with saved browser credentials opens the MCP tab on `/admin`
+- **THEN** the Register MCP server name, URL, and bearer token inputs initialize empty and declare autocomplete suppression attributes so the browser does not pre-fill the administrator's saved email or password

@@ -39,6 +39,12 @@ const router = vi.hoisted(() => ({ push: vi.fn() }));
 const session = vi.hoisted(() => ({
   role: "user" as "user" | "admin",
 }));
+const hostedSDK = vi.hoisted(() => ({
+  startSession: vi.fn(),
+  endSession: vi.fn(),
+  setMuted: vi.fn(),
+  setVolume: vi.fn(),
+}));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => router,
@@ -57,6 +63,16 @@ vi.mock("@/lib/api-client", () => ({
 
 vi.mock("@/components/LiquidPlasmaOrb", () => ({
   LiquidPlasmaOrb: () => createElement("div", { "data-testid": "orb" }),
+}));
+
+vi.mock("@elevenlabs/react", () => ({
+  ConversationProvider: ({ children }: { children: ReactNode }) => createElement("div", null, children),
+  useConversation: () => ({
+    ...hostedSDK,
+    getInputVolume: () => 0,
+    getOutputVolume: () => 0,
+    isSpeaking: false,
+  }),
 }));
 
 vi.mock("@/hooks/useVoiceAgentRTC", async (importOriginal) => {
@@ -169,8 +185,12 @@ describe("home-page citation rendering", () => {
 
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.mocked(apiFetch).mockResolvedValue({ mode: "cascaded", assistantName: "Aegis", audioFocusEnabled: true });
+    hostedSDK.startSession.mockClear();
+    hostedSDK.endSession.mockClear();
     session.role = "user";
     rtcState.assistantName = "Aegis";
+    rtcState.cameraEnabled = false;
     rtcState.transcripts = [];
     rtcState.citations = [
       {
@@ -237,6 +257,37 @@ describe("home-page citation rendering", () => {
     });
 
     expect(container.textContent).toContain("The supported workflow is documented here.");
+  });
+
+  it("discloses hosted policy and omits backend citations, tools, and camera controls", async () => {
+    session.role = "admin";
+    rtcState.cameraEnabled = true;
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.endsWith("/rtc/config")) return { mode: "elevenlabs_agent", assistantName: "Aegis" };
+      if (path.endsWith("/elevenlabs/conversation-token")) {
+        return { conversationToken: "transient", conversationId: "conv_fixture", mode: "elevenlabs_agent" };
+      }
+      if (path.endsWith("/auth/me")) return { user: { isActive: true } };
+      return {};
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => root.render(createElement(HomePage)));
+    expect(container.textContent).toContain("enabled Agent Skills");
+    expect(container.textContent).toContain("Local wake/question/pause rules");
+    expect(container.textContent).not.toContain("User Guide.pdf");
+    expect(container.textContent).not.toContain("load_skill");
+    const cameraButton = container.querySelector<HTMLButtonElement>('[aria-label="Enable Camera"]');
+    expect(cameraButton?.disabled).toBe(true);
+
+    const startButton = container.querySelector<HTMLButtonElement>('[aria-label="Start Voice Session"]');
+    await act(async () => startButton?.click());
+    const options = hostedSDK.startSession.mock.calls[0]?.[0];
+    expect(options).toBeDefined();
+    expect(options).not.toHaveProperty("conversation_config_override");
+    expect(options).not.toHaveProperty("overrides");
   });
 
   it("renders configured English or Chinese assistantName in header and assistant transcript labels", async () => {

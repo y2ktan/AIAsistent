@@ -10,6 +10,7 @@ web/node_modules/
 web/.next/
 web/out/
 web/coverage/
+web/public/elevenlabs/rawAudioProcessor.js
 web/next-env.d.ts
 *.tsbuildinfo
 
