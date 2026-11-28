@@ -259,7 +259,7 @@ describe("home-page citation rendering", () => {
     expect(container.textContent).toContain("The supported workflow is documented here.");
   });
 
-  it("discloses hosted policy and omits backend citations, tools, and camera controls", async () => {
+  it("omits hosted disclosure text, citations, tools, and camera controls", async () => {
     session.role = "admin";
     rtcState.cameraEnabled = true;
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
@@ -275,8 +275,9 @@ describe("home-page citation rendering", () => {
     root = createRoot(container);
 
     await act(async () => root.render(createElement(HomePage)));
-    expect(container.textContent).toContain("enabled Agent Skills");
-    expect(container.textContent).toContain("Local wake/question/pause rules");
+    expect(container.textContent).not.toContain("enabled Agent Skills");
+    expect(container.textContent).not.toContain("Local wake/question/pause rules");
+    expect(container.textContent).not.toContain("ElevenLabs processes audio and knowledge");
     expect(container.textContent).not.toContain("User Guide.pdf");
     expect(container.textContent).not.toContain("load_skill");
     const cameraButton = container.querySelector<HTMLButtonElement>('[aria-label="Enable Camera"]');

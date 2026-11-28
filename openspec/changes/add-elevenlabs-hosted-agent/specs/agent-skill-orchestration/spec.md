@@ -18,9 +18,9 @@ In `cascaded` and `realtime` modes, the system SHALL expose enabled Agent Skills
 ### Requirement: Hosted runtime-tool exclusion
 The initial hosted mode SHALL NOT expose or execute runtime backend skill loaders (`load_skill`, `read_skill_file`) or application MCP tools. While enabled declarative Agent Skills synchronize server-side into the hosted prompt, MCP server administration SHALL remain scoped to existing backend modes without synchronizing MCP servers or tool credentials to ElevenLabs.
 
-#### Scenario: Hosted session cannot invoke backend MCP tools
+#### Scenario: Hosted session cannot invoke the local backend MCP loop
 - **WHEN** a hosted conversation requests a live external MCP lookup
-- **THEN** the application has no hosted runtime tool bridge to execute that operation and never transmits MCP server credentials to ElevenLabs
+- **THEN** the application does not start a local tool loop, and only a separately validated provider-managed or explicitly selected hosted integration can execute the operation
 
 #### Scenario: Oversized skill bundle rejected for hosted prompt sync
 - **WHEN** enabled Agent Skills exceed the configured hosted prompt size budget during hosted activation or skill synchronization

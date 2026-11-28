@@ -47,7 +47,7 @@ Hosted sessions SHALL ground document answers using the configured agent's attac
 - **THEN** synchronizing local documents preserves that dashboard document on the agent alongside the application-managed documents
 
 ### Requirement: Provider-owned conversation behavior with server-synchronized persona
-Hosted sessions SHALL apply the server-synchronized agent prompt (`assistantName`, `systemInstructions`, and enabled declarative Agent Skills) while using the agent's dashboard-defined turn-taking, interruption, language, voice, TTS model, and LLM settings without client-side runtime overrides. Before connection, the UI SHALL disclose external processing and that application wake-name, direct-question, pause-buffer, and language fallback rules do not apply.
+Hosted sessions SHALL apply the server-synchronized agent prompt (`assistantName`, `systemInstructions`, and enabled declarative Agent Skills) while using the agent's dashboard-defined turn-taking, interruption, language, voice, TTS model, and LLM settings without client-side runtime overrides. Hosted settings SHALL disclose provider ownership, external processing, potential charges, and application feature limits before activation; the voice screen SHALL NOT repeat this disclosure.
 
 #### Scenario: Speech without a wake name
 - **WHEN** a user speaks without the application's configured wake name in a hosted session
@@ -56,6 +56,10 @@ Hosted sessions SHALL apply the server-synchronized agent prompt (`assistantName
 #### Scenario: Synchronized persona and skills apply while voice and language remain dashboard-owned
 - **WHEN** an administrator has synchronized `assistantName`, `systemInstructions`, and enabled Agent Skills while the hosted agent's voice or language configuration differs from the application's saved language table
 - **THEN** the hosted agent uses the server-synchronized prompt and persona without sending client-side voice or language overrides or promising the application's language fallback behavior
+
+#### Scenario: Hosted disclosure remains in settings, not the voice screen
+- **WHEN** an administrator configures hosted mode and a user opens the hosted voice screen
+- **THEN** hosted settings disclose provider ownership, external processing, potential charges, and application feature limits, while the voice screen omits the repeated disclosure
 
 ### Requirement: Audio controls and hosted session cleanup
 The system SHALL let users independently mute microphone capture and speaker playback without ending a hosted connection. Ending the call, leaving the voice view, logging out, or detecting invalid application authentication SHALL disconnect the hosted session and release owned microphone and playback resources.
@@ -96,7 +100,7 @@ The initial hosted mode SHALL be audio-only and SHALL NOT expose runtime backend
 
 #### Scenario: Unsupported controls in hosted mode
 - **WHEN** a user opens or starts hosted voice
-- **THEN** camera and application MCP/tool-activity controls are unavailable, local citations are cleared, and the UI identifies synchronized prompt/knowledge boundaries and runtime tools being unsupported
+- **THEN** camera and application MCP/tool-activity controls are unavailable and local citations are cleared
 
 #### Scenario: Agent configured with external tools
 - **WHEN** activation testing or session issuance finds external tools enabled on the configured hosted agent

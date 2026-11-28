@@ -37,8 +37,8 @@ The system SHALL allow administrators to configure active AI pipeline mode (`rea
 ### Requirement: Hosted-agent activation validation and synchronization
 The system SHALL reject hosted activation without an agent ID and a saved or submitted ElevenLabs credential. Before completing hosted activation or saving updated hosted settings, the server SHALL validate private-agent authentication and the absence of external tools, and SHALL synchronize `assistantName`, `systemInstructions`, enabled Agent Skills, and `ready` local documents without requiring local speech voices, endpoints, or embedding settings.
 
-#### Scenario: Complete private RAG-only agent activated and synchronized
-- **WHEN** an administrator activates a reachable private agent without external tools using a valid write-capable ElevenLabs credential
+#### Scenario: Complete private agent activated and synchronized
+- **WHEN** an administrator activates a reachable private agent using a valid write-capable ElevenLabs credential and every configured workflow, tool, and MCP reference passes validation
 - **THEN** the server synchronizes the application's prompt/persona, enabled Agent Skills, and `ready` local documents to the hosted agent, enables hosted RAG while preserving unmanaged dashboard documents, and saves `elevenlabs_agent` without changing local voices, language defaults, or provider settings
 
 #### Scenario: Incomplete, incompatible, or non-writable agent

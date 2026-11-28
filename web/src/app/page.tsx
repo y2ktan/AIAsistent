@@ -137,15 +137,6 @@ function VoiceHome({ voice, hosted }: { voice: ReturnType<typeof useVoiceAgentRT
       {/* Center Stage: Liquid Plasma Orb + Kinetic Captions + Citations */}
       <section className="relative z-10 flex flex-1 flex-col items-center justify-center px-4 pb-28">
         <LiquidPlasmaOrb state={agentState} getAudioEnergy={getAudioEnergy} />
-        {hosted && (
-          <p className="mt-4 max-w-lg text-center text-xs text-slate-400">
-            Assistant Name, System Instructions, enabled Agent Skills, and ready local documents are
-            synchronized server-side. ElevenLabs processes audio and knowledge in the cloud and owns
-            the model, voice, languages, retention, turn-taking, interruption, and noise handling.
-            Usage may incur charges. Local wake/question/pause rules and Audio Focus do not apply.
-            Camera, local citations, and runtime MCP tools are unavailable.
-          </p>
-        )}
 
         {(permissionPrompt || errorMsg) && (
           <div
