@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -51,6 +52,83 @@ func (s *Service) Ingest(ctx context.Context, title, filename string, data []byt
 		return doc, err
 	}
 	return s.store.GetDocument(ctx, doc.ID)
+}
+
+func (s *Service) ReplaceFailedPDF(
+	ctx context.Context,
+	docID, filename string,
+	data []byte,
+	embedder Embedder,
+) (*Document, error) {
+	docType, mimeType, err := ValidateUpload(filename, data, s.maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if docType != DocTypePDF {
+		return nil, ErrUnsupportedType
+	}
+	doc, err := s.store.GetDocument(ctx, docID)
+	if err != nil {
+		return nil, err
+	}
+	if doc.Status != "failed" || doc.MimeType != "application/pdf" {
+		return nil, ErrDocumentNotFailed
+	}
+
+	text, err := ExtractText(docType, data)
+	if err != nil {
+		return s.failDocumentReplacement(ctx, doc, err)
+	}
+	chunks := ChunkText(text, 2400, 360)
+	if len(chunks) == 0 {
+		return s.failDocumentReplacement(ctx, doc, ErrExtractionFailed)
+	}
+	if embedder == nil {
+		return s.failDocumentReplacement(ctx, doc, errors.New("embedding provider not configured"))
+	}
+	chunkTexts := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		chunkTexts[i] = chunk.Content
+	}
+	vectors, err := embedder.Embed(ctx, chunkTexts)
+	if err != nil {
+		return s.failDocumentReplacement(ctx, doc, err)
+	}
+	if len(vectors) != len(chunks) {
+		return s.failDocumentReplacement(ctx, doc, errors.New("embedding provider returned an invalid vector count"))
+	}
+	dbChunks := make([]DocumentChunk, len(chunks))
+	for i, chunk := range chunks {
+		dbChunks[i] = DocumentChunk{
+			DocumentID: docID,
+			ChunkIndex: chunk.Index,
+			Content:    chunk.Content,
+			TokenCount: chunk.TokenCount,
+			Embedding:  vectors[i],
+		}
+	}
+
+	sum := sha256.Sum256(data)
+	if err := s.store.ReplaceFailedDocument(
+		ctx, docID, filepath.Base(filename), mimeType, int64(len(data)), hex.EncodeToString(sum[:]),
+		dbChunks, text,
+	); err != nil {
+		return nil, err
+	}
+	return s.store.GetDocument(ctx, docID)
+}
+
+func (s *Service) failDocumentReplacement(ctx context.Context, doc *Document, failure error) (*Document, error) {
+	if err := s.store.UpdateDocumentStatus(
+		ctx, doc.ID, "failed", security.RedactString(failure.Error()), doc.ChunkCount,
+	); err != nil {
+		return nil, errors.Join(failure, fmt.Errorf("failed to record replacement failure: %w", err))
+	}
+	updated, err := s.store.GetDocument(ctx, doc.ID)
+	if err != nil {
+		return nil, errors.Join(failure, fmt.Errorf("failed to reload document after replacement failure: %w", err))
+	}
+	return updated, failure
 }
 
 func (s *Service) ReindexWithText(ctx context.Context, docID string, embedder Embedder, chunksText []string) error {
@@ -103,7 +181,7 @@ func (s *Service) Reindex(ctx context.Context, docID string, embedder Embedder) 
 func (s *Service) indexDocumentData(ctx context.Context, doc *Document, docType DocType, data []byte, embedder Embedder) error {
 	text, err := ExtractText(docType, data)
 	if err != nil {
-		_ = s.store.UpdateDocumentStatus(ctx, doc.ID, "failed", "text extraction failed", 0)
+		_ = s.store.UpdateDocumentStatus(ctx, doc.ID, "failed", security.RedactString(err.Error()), 0)
 		return err
 	}
 	chunks := ChunkText(text, 2400, 360)

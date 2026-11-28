@@ -36,7 +36,7 @@ In `elevenlabs_agent` mode, the system SHALL connect microphone input to the con
 - **THEN** the hosted agent processes the speech and returns a spoken answer with transcript updates in the application's voice UI
 
 ### Requirement: Synchronized and dashboard knowledge grounding
-Hosted sessions SHALL ground document answers using the configured agent's attached ElevenLabs Knowledge Base and RAG index, combining local `ready` application documents synchronized server-side with any additional unmanaged documents attached in the ElevenLabs dashboard. During a hosted voice call, the application SHALL NOT query its local pgvector store at turn time.
+Hosted sessions SHALL ground document answers using the configured agent's attached ElevenLabs Knowledge Base and RAG index, combining locally `ready` application documents synchronized server-side while application RAG synchronization is enabled with any additional unmanaged documents attached in the ElevenLabs dashboard. During a hosted voice call, the application SHALL NOT query its local pgvector store at turn time.
 
 #### Scenario: Synchronized local or dashboard policy answers a question
 - **WHEN** a local `ready` policy document has been synchronized and indexed on the configured hosted agent (alongside any dashboard-attached documents) and the user asks a question covered by that policy
@@ -45,6 +45,14 @@ Hosted sessions SHALL ground document answers using the configured agent's attac
 #### Scenario: Unmanaged dashboard documents preserved alongside synced local documents
 - **WHEN** the configured hosted agent also has a document attached directly in the ElevenLabs dashboard that is not tracked by the application
 - **THEN** synchronizing local documents preserves that dashboard document on the agent alongside the application-managed documents
+
+#### Scenario: Administrator syncs a single ready local document
+- **WHEN** application RAG synchronization is enabled and an administrator requests sync or retry for one locally `ready` document
+- **THEN** the server uploads or updates only that tracked document, verifies its hosted attachment and index state, and leaves other local and dashboard-managed entries unchanged
+
+#### Scenario: Application RAG synchronization is disabled
+- **WHEN** an administrator requests global or per-document application knowledge synchronization while the saved application RAG synchronization setting is disabled
+- **THEN** the server does not upload, attach, or index local documents at ElevenLabs, while dashboard-managed hosted knowledge remains available to the conversation
 
 ### Requirement: Provider-owned conversation behavior with server-synchronized persona
 Hosted sessions SHALL apply the server-synchronized agent prompt (`assistantName`, `systemInstructions`, and enabled declarative Agent Skills) while using the agent's dashboard-defined turn-taking, interruption, language, voice, TTS model, and LLM settings without client-side runtime overrides. Hosted settings SHALL disclose provider ownership, external processing, potential charges, and application feature limits before activation; the voice screen SHALL NOT repeat this disclosure.

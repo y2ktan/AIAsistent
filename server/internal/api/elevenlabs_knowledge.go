@@ -183,6 +183,185 @@ func (s *Server) syncHostedDocuments(ctx context.Context, config *AgentConfigRec
 	return nil
 }
 
+func (s *Server) syncHostedDocument(ctx context.Context, config *AgentConfigRecord, docID string) error {
+	if config == nil || config.Mode != "elevenlabs_agent" {
+		return errors.New("Hosted document synchronization requires hosted mode.")
+	}
+	if !config.ElevenLabsRAGSyncEnabled {
+		return errors.New("Application RAG synchronization is disabled. Enable and save it in AI Agent settings before retrying.")
+	}
+	if s.ragSvc == nil {
+		return errors.New("Local document storage is unavailable for hosted synchronization.")
+	}
+	docs, err := s.ragSvc.List(ctx)
+	if err != nil {
+		return errors.New("Could not load local document synchronization state.")
+	}
+	managedIDs := make(map[string]struct{}, len(docs)+1)
+	for _, currentDoc := range docs {
+		if currentDoc.ElevenLabsDocID != "" {
+			managedIDs[currentDoc.ElevenLabsDocID] = struct{}{}
+		}
+	}
+	doc, err := s.ragSvc.GetDocument(ctx, docID)
+	if err != nil {
+		return err
+	}
+	if doc.Status != "ready" {
+		return errors.New("Document must be locally ready before hosted synchronization.")
+	}
+	if doc.ElevenLabsDocID != "" {
+		managedIDs[doc.ElevenLabsDocID] = struct{}{}
+	}
+	if strings.TrimSpace(doc.ExtractedText) == "" {
+		err := errors.New("Document has no extracted text.")
+		if stateErr := s.saveHostedSyncState(ctx, doc, doc.ElevenLabsAgentID, doc.ElevenLabsDocID, doc.ElevenLabsSyncedHash, "failed", err); stateErr != nil {
+			return stateErr
+		}
+		return err
+	}
+
+	key, err := s.hostedKey(config)
+	if err != nil {
+		if stateErr := s.saveHostedSyncState(ctx, doc, doc.ElevenLabsAgentID, doc.ElevenLabsDocID, doc.ElevenLabsSyncedHash, "failed", err); stateErr != nil {
+			return stateErr
+		}
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	client := newHostedClient(s.allowPrivate)
+	agentPath := "/v1/convai/agents/" + url.PathEscape(config.ElevenLabsAgentID)
+	current, err := loadHostedAgent(ctx, client, key, config.ElevenLabsAgentID)
+	if err != nil {
+		if stateErr := s.saveHostedSyncState(ctx, doc, doc.ElevenLabsAgentID, doc.ElevenLabsDocID, doc.ElevenLabsSyncedHash, "failed", err); stateErr != nil {
+			return stateErr
+		}
+		return err
+	}
+	fail := func(syncErr error) error {
+		if stateErr := s.saveHostedSyncState(
+			ctx, doc, doc.ElevenLabsAgentID, doc.ElevenLabsDocID, doc.ElevenLabsSyncedHash, "failed", syncErr,
+		); stateErr != nil {
+			return stateErr
+		}
+		return syncErr
+	}
+
+	textHashBytes := sha256.Sum256([]byte(doc.ExtractedText))
+	textHash := hex.EncodeToString(textHashBytes[:])
+	hostedDocID := doc.ElevenLabsDocID
+	sameContent := hostedDocID != "" &&
+		doc.ElevenLabsAgentID == config.ElevenLabsAgentID &&
+		doc.ElevenLabsSyncedHash == textHash
+	if !sameContent {
+		if hostedDocID != "" {
+			if err := deleteHostedKnowledgeBaseDocument(ctx, client, key, hostedDocID); err != nil {
+				return fail(err)
+			}
+			if err := s.saveHostedSyncState(ctx, doc, config.ElevenLabsAgentID, "", "", "not_synced", nil); err != nil {
+				return err
+			}
+		}
+		hostedDocID, err = createHostedKnowledgeBaseDocument(ctx, client, key, doc.Title, doc.ExtractedText)
+		if err != nil {
+			return fail(err)
+		}
+		if err := s.saveHostedSyncState(ctx, doc, config.ElevenLabsAgentID, hostedDocID, textHash, "not_synced", nil); err != nil {
+			return err
+		}
+	}
+
+	status := doc.ElevenLabsSyncStatus
+	if !sameContent || status != "synced" {
+		if len([]byte(doc.ExtractedText)) >= hostedRAGMinimumBytes {
+			status, err = computeHostedRAGIndex(ctx, client, key, hostedDocID)
+			if err != nil {
+				return fail(err)
+			}
+		} else {
+			status = "synced"
+		}
+	}
+	if err := s.saveHostedSyncState(ctx, doc, config.ElevenLabsAgentID, hostedDocID, textHash, status, nil); err != nil {
+		return err
+	}
+
+	allDocs, err := s.ragSvc.List(ctx)
+	if err != nil {
+		return errors.New("Could not reload local document synchronization state.")
+	}
+	for _, currentDoc := range allDocs {
+		if currentDoc.ElevenLabsDocID != "" {
+			managedIDs[currentDoc.ElevenLabsDocID] = struct{}{}
+		}
+	}
+	knowledgeBase, err := hostedKnowledgeBaseForSync(
+		current.Conversation.Agent.Prompt.KnowledgeBase,
+		managedIDs,
+		allDocs,
+		config.ElevenLabsAgentID,
+	)
+	if err != nil {
+		return err
+	}
+	ragSettings, err := hostedRAGSettings(current.Conversation.Agent.Prompt.RAG)
+	if err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"conversation_config": map[string]any{
+			"agent": map[string]any{
+				"prompt": map[string]any{
+					"knowledge_base": knowledgeBase,
+					"rag":            ragSettings,
+				},
+			},
+		},
+	}
+	if err := hostedPatch(ctx, client, key, agentPath, payload); err != nil {
+		return fail(err)
+	}
+	verified, err := loadHostedAgent(ctx, client, key, config.ElevenLabsAgentID)
+	if err != nil {
+		return fail(fmt.Errorf("Hosted Knowledge Base update could not be verified: %w", err))
+	}
+	if err := verifyHostedKnowledgeBase(verified.Conversation.Agent.Prompt.KnowledgeBase, knowledgeBase, managedIDs); err != nil {
+		return fail(err)
+	}
+	return nil
+}
+
+func verifyHostedKnowledgeBase(actual, expected []json.RawMessage, managedIDs map[string]struct{}) error {
+	actualIDs := make(map[string]struct{}, len(actual))
+	for _, raw := range actual {
+		var entry hostedKnowledgeBaseEntry
+		if err := json.Unmarshal(raw, &entry); err != nil || entry.ID == "" {
+			return errors.New("ElevenLabs returned an invalid Knowledge Base entry.")
+		}
+		actualIDs[entry.ID] = struct{}{}
+	}
+	expectedIDs := make(map[string]struct{}, len(expected))
+	for _, raw := range expected {
+		var entry hostedKnowledgeBaseEntry
+		if err := json.Unmarshal(raw, &entry); err != nil || entry.ID == "" {
+			return errors.New("Could not verify the targeted hosted Knowledge Base entry.")
+		}
+		expectedIDs[entry.ID] = struct{}{}
+		if _, ok := actualIDs[entry.ID]; !ok {
+			return errors.New("Hosted Knowledge Base update could not be verified.")
+		}
+	}
+	for id := range managedIDs {
+		if _, expected := expectedIDs[id]; !expected {
+			if _, actual := actualIDs[id]; actual {
+				return errors.New("Hosted Knowledge Base retained a stale application-managed entry.")
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) saveHostedSyncState(
 	ctx context.Context,
 	doc *rag.Document,

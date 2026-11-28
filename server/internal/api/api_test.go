@@ -104,6 +104,33 @@ func (m *mockRAGStore) ReplaceDocumentChunks(_ context.Context, id string, chunk
 	return nil
 }
 
+func (m *mockRAGStore) ReplaceFailedDocument(
+	_ context.Context,
+	id, filename, mimeType string,
+	sizeBytes int64,
+	sha256Hash string,
+	chunks []rag.DocumentChunk,
+	text string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	doc, ok := m.docs[id]
+	if !ok {
+		return rag.ErrNotFound
+	}
+	if doc.Status != "failed" || doc.MimeType != "application/pdf" {
+		return rag.ErrDocumentNotFailed
+	}
+	m.chunks[id] = append([]rag.DocumentChunk(nil), chunks...)
+	doc.Filename, doc.MimeType = filename, mimeType
+	doc.SizeBytes, doc.SHA256Hash = sizeBytes, sha256Hash
+	doc.Status, doc.ErrorMessage, doc.ChunkCount = "ready", "", len(chunks)
+	doc.ExtractedText = text
+	doc.ElevenLabsSyncStatus = "not_synced"
+	doc.ElevenLabsSyncError = ""
+	return nil
+}
+
 func (m *mockRAGStore) DeleteDocument(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

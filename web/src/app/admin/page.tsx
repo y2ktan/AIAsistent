@@ -148,6 +148,8 @@ export default function AdminPage() {
   // RAG state
   const [docs, setDocs] = useState<DocRecord[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [replacingDocId, setReplacingDocId] = useState<string | null>(null);
+  const [syncingDocId, setSyncingDocId] = useState<string | null>(null);
   const [syncingHosted, setSyncingHosted] = useState(false);
   const [savedHostedPolicy, setSavedHostedPolicy] = useState({ rag: true, skills: true });
 
@@ -420,6 +422,48 @@ export default function AdminPage() {
       setNotice({ type: "err", text: err instanceof Error ? err.message : "Upload failed" });
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function replaceFailedDocument(docId: string, file: File) {
+    setReplacingDocId(docId);
+    setNotice(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const result = await apiFetch<{ document: DocRecord; warning?: string }>(
+        `/api/v1/admin/documents/${docId}/replace`,
+        { method: "POST", body: formData },
+      );
+      setDocs((current) => current.map((doc) => doc.id === docId ? result.document : doc));
+      setNotice(result.warning
+        ? { type: "err", text: result.warning }
+        : { type: "ok", text: "Replacement PDF processed and indexed." });
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "PDF replacement failed" });
+    } finally {
+      await loadAll();
+      setReplacingDocId(null);
+    }
+  }
+
+  async function syncHostedDocument(docId: string) {
+    setSyncingDocId(docId);
+    setNotice(null);
+    try {
+      const result = await apiFetch<{ document: DocRecord; warning?: string }>(
+        `/api/v1/admin/documents/${docId}/sync`,
+        { method: "POST", body: "{}" },
+      );
+      setDocs((current) => current.map((doc) => doc.id === docId ? result.document : doc));
+      setNotice(result.warning
+        ? { type: "err", text: result.warning }
+        : { type: "ok", text: "Document hosted synchronization completed." });
+    } catch (err) {
+      setNotice({ type: "err", text: err instanceof Error ? err.message : "Hosted document synchronization failed" });
+    } finally {
+      await loadAll();
+      setSyncingDocId(null);
     }
   }
 
@@ -1027,6 +1071,11 @@ export default function AdminPage() {
                         {d.errorMessage && (
                           <p className="mt-1 text-xs text-rose-300">{d.errorMessage}</p>
                         )}
+                        {d.status === "failed" && d.filename.toLowerCase().endsWith(".pdf") && (
+                          <p className="mt-1 text-xs text-slate-400">
+                            The original PDF is not retained. Upload a corrected PDF to reprocess this record.
+                          </p>
+                        )}
                       </td>
                       {cfg.mode === "elevenlabs_agent" && (
                         <td className="px-4 py-3">
@@ -1055,13 +1104,56 @@ export default function AdminPage() {
                       )}
                       <td className="px-4 py-3 text-slate-300">{d.chunkCount}</td>
                       <td className="px-4 py-3 text-right">
-                        <button
-                          onClick={() => handleDeleteDoc(d.id)}
-                          aria-label={`Delete ${d.title}`}
-                          className="rounded-lg border border-rose-500/30 p-1.5 text-rose-300 hover:bg-rose-500/15"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        <div className="flex items-center justify-end gap-2">
+                          {d.status === "failed" && d.filename.toLowerCase().endsWith(".pdf") && (
+                            <label className={`inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-slate-800 ${replacingDocId ? "pointer-events-none opacity-50" : ""}`}>
+                              {replacingDocId === d.id
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                : <Upload className="h-3.5 w-3.5" />}
+                              {replacingDocId === d.id ? "Processing..." : "Replace PDF"}
+                              <input
+                                type="file"
+                                accept=".pdf,application/pdf"
+                                aria-label={`Replace failed PDF ${d.title}`}
+                                disabled={replacingDocId !== null}
+                                onChange={(event) => {
+                                  const file = event.target.files?.[0];
+                                  if (file) void replaceFailedDocument(d.id, file);
+                                  event.currentTarget.value = "";
+                                }}
+                                className="hidden"
+                              />
+                            </label>
+                          )}
+                          {cfg.mode === "elevenlabs_agent" && d.status === "ready" && (
+                            <div className="flex flex-col items-end gap-1">
+                              <button
+                                type="button"
+                                onClick={() => void syncHostedDocument(d.id)}
+                                disabled={!savedHostedPolicy.rag || syncingDocId !== null}
+                                title={!savedHostedPolicy.rag ? "Enable and save application RAG synchronization in AI Agent settings before retrying." : undefined}
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-2.5 py-1.5 text-xs text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {syncingDocId === d.id
+                                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  : <RefreshCw className="h-3.5 w-3.5" />}
+                                {syncingDocId === d.id ? "Syncing..." : "Sync / retry"}
+                              </button>
+                              {!savedHostedPolicy.rag && (
+                                <span className="max-w-48 text-right text-[11px] leading-4 text-amber-200/80">
+                                  Disabled by saved policy. Enable and save in AI Agent settings.
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          <button
+                            onClick={() => handleDeleteDoc(d.id)}
+                            aria-label={`Delete ${d.title}`}
+                            className="rounded-lg border border-rose-500/30 p-1.5 text-rose-300 hover:bg-rose-500/15"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}

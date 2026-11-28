@@ -2,8 +2,11 @@ package rag
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+var ErrDocumentNotFailed = errors.New("document is not a failed PDF")
 
 type Document struct {
 	ID                   string    `json:"id"`
@@ -47,6 +50,7 @@ type Store interface {
 	CreateDocument(ctx context.Context, doc *Document) error
 	UpdateDocumentStatus(ctx context.Context, docID, status, errMsg string, chunkCount int) error
 	ReplaceDocumentChunks(ctx context.Context, docID string, chunks []DocumentChunk, extractedText string) error
+	ReplaceFailedDocument(ctx context.Context, docID, filename, mimeType string, sizeBytes int64, sha256Hash string, chunks []DocumentChunk, extractedText string) error
 	DeleteDocument(ctx context.Context, docID string) error
 	GetDocument(ctx context.Context, docID string) (*Document, error)
 	ListDocuments(ctx context.Context) ([]Document, error)

@@ -69,6 +69,37 @@ func (m *memRAGStore) ReplaceDocumentChunks(_ context.Context, docID string, chu
 	return nil
 }
 
+func (m *memRAGStore) ReplaceFailedDocument(
+	_ context.Context,
+	docID, filename, mimeType string,
+	sizeBytes int64,
+	sha256Hash string,
+	chunks []DocumentChunk,
+	extractedText string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	doc, ok := m.docs[docID]
+	if !ok {
+		return ErrNotFound
+	}
+	if doc.Status != "failed" || doc.MimeType != "application/pdf" {
+		return ErrDocumentNotFailed
+	}
+	m.chunks[docID] = append([]DocumentChunk(nil), chunks...)
+	doc.Filename = filename
+	doc.MimeType = mimeType
+	doc.SizeBytes = sizeBytes
+	doc.SHA256Hash = sha256Hash
+	doc.Status = "ready"
+	doc.ErrorMessage = ""
+	doc.ChunkCount = len(chunks)
+	doc.ExtractedText = extractedText
+	doc.ElevenLabsSyncStatus = "not_synced"
+	doc.ElevenLabsSyncError = ""
+	return nil
+}
+
 func (m *memRAGStore) DeleteDocument(_ context.Context, docID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -251,6 +282,8 @@ func TestExtractionAndChunking(t *testing.T) {
 	if err != nil || !strings.Contains(txt, "Pion WebRTC") {
 		t.Fatalf("DOCX extraction failed: %q err=%v", txt, err)
 	}
+	installFakePDFTools(t)
+	t.Setenv("PDF_TEXT", "Pion WebRTC Guide")
 	pdf := []byte("%PDF-1.4\n1 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 712 Td (Pion WebRTC Guide) Tj ET\nendstream\nendobj")
 	ptxt, err := ExtractText(DocTypePDF, pdf)
 	if err != nil || !strings.Contains(ptxt, "Pion WebRTC Guide") {
@@ -330,5 +363,114 @@ func TestIngestRetrieveAndDelete(t *testing.T) {
 	stored, _ := store.GetDocument(context.Background(), failDoc.ID)
 	if stored.Status != "failed" || strings.Contains(stored.ErrorMessage, "secret1234567890") {
 		t.Fatalf("expected failed status with redacted error, got %+v", stored)
+	}
+}
+
+func TestReplaceFailedPDFIsAtomic(t *testing.T) {
+	t.Run("success replaces source and chunks", func(t *testing.T) {
+		installFakePDFTools(t)
+		t.Setenv("PDF_TEXT", "Corrected PDF policy text")
+		store := newMemRAGStore()
+		doc := &Document{
+			Title: "Policy", Filename: "broken.pdf", MimeType: "application/pdf",
+			SizeBytes: 10, SHA256Hash: "old-hash", Status: "failed", ErrorMessage: "old extraction error",
+		}
+		if err := store.CreateDocument(context.Background(), doc); err != nil {
+			t.Fatal(err)
+		}
+		store.chunks[doc.ID] = []DocumentChunk{{DocumentID: doc.ID, ChunkIndex: 0, Content: "old chunk"}}
+
+		source := []byte("%PDF-1.7\ncorrected source")
+		updated, err := NewService(store, DefaultMaxUploadBytes).ReplaceFailedPDF(
+			context.Background(), doc.ID, "corrected.pdf", source, &mockEmbedder{},
+		)
+		if err != nil {
+			t.Fatalf("ReplaceFailedPDF returned an error: %v", err)
+		}
+		if updated.ID != doc.ID || updated.Status != "ready" || updated.Filename != "corrected.pdf" ||
+			updated.SizeBytes != int64(len(source)) || updated.SHA256Hash == "old-hash" ||
+			updated.ExtractedText != "Corrected PDF policy text" {
+			t.Fatalf("replacement metadata was not committed: %+v", updated)
+		}
+		if chunks := store.chunks[doc.ID]; len(chunks) != 1 || chunks[0].Content != "Corrected PDF policy text" {
+			t.Fatalf("replacement chunks were not committed: %+v", chunks)
+		}
+	})
+
+	t.Run("extraction failure preserves source and chunks", func(t *testing.T) {
+		installFakePDFTools(t)
+		store := newMemRAGStore()
+		doc := &Document{
+			Title: "Policy", Filename: "broken.pdf", MimeType: "application/pdf",
+			SizeBytes: 10, SHA256Hash: "old-hash", Status: "failed", ErrorMessage: "old extraction error",
+			ChunkCount: 1,
+		}
+		if err := store.CreateDocument(context.Background(), doc); err != nil {
+			t.Fatal(err)
+		}
+		store.chunks[doc.ID] = []DocumentChunk{{DocumentID: doc.ID, ChunkIndex: 0, Content: "preserved chunk"}}
+
+		updated, err := NewService(store, DefaultMaxUploadBytes).ReplaceFailedPDF(
+			context.Background(), doc.ID, "replacement.pdf", []byte("%PDF-1.7\nempty"), &mockEmbedder{},
+		)
+		if !errors.Is(err, ErrExtractionFailed) {
+			t.Fatalf("expected extraction failure, got %v", err)
+		}
+		if updated == nil || updated.Status != "failed" || updated.Filename != "broken.pdf" || updated.SHA256Hash != "old-hash" {
+			t.Fatalf("failed replacement changed source metadata or readiness: %+v", updated)
+		}
+		if chunks := store.chunks[doc.ID]; len(chunks) != 1 || chunks[0].Content != "preserved chunk" {
+			t.Fatalf("failed replacement changed existing chunks: %+v", chunks)
+		}
+		if updated.ErrorMessage == "" || !strings.Contains(updated.ErrorMessage, "no readable text") {
+			t.Fatalf("expected actionable extraction error, got %q", updated.ErrorMessage)
+		}
+	})
+
+	t.Run("embedding failure preserves source and chunks", func(t *testing.T) {
+		installFakePDFTools(t)
+		t.Setenv("PDF_TEXT", "replacement text")
+		store := newMemRAGStore()
+		doc := &Document{
+			Title: "Policy", Filename: "broken.pdf", MimeType: "application/pdf",
+			SizeBytes: 10, SHA256Hash: "old-hash", Status: "failed", ChunkCount: 1,
+		}
+		if err := store.CreateDocument(context.Background(), doc); err != nil {
+			t.Fatal(err)
+		}
+		store.chunks[doc.ID] = []DocumentChunk{{DocumentID: doc.ID, ChunkIndex: 0, Content: "preserved chunk"}}
+
+		updated, err := NewService(store, DefaultMaxUploadBytes).ReplaceFailedPDF(
+			context.Background(), doc.ID, "replacement.pdf", []byte("%PDF-1.7\nreplacement"), &mockEmbedder{fail: true},
+		)
+		if err == nil || updated == nil || updated.Status != "failed" || updated.Filename != "broken.pdf" {
+			t.Fatalf("expected failed non-ready replacement, doc=%+v err=%v", updated, err)
+		}
+		if chunks := store.chunks[doc.ID]; len(chunks) != 1 || chunks[0].Content != "preserved chunk" {
+			t.Fatalf("failed replacement changed existing chunks: %+v", chunks)
+		}
+		if strings.Contains(updated.ErrorMessage, "secret1234567890") {
+			t.Fatalf("replacement failure leaked provider secret: %q", updated.ErrorMessage)
+		}
+	})
+}
+
+func TestIngestPersistsSanitizedPDFExtractionError(t *testing.T) {
+	installFakePDFTools(t)
+	t.Setenv("PDF_PAGES", "101")
+	store := newMemRAGStore()
+
+	doc, err := NewService(store, DefaultMaxUploadBytes).Ingest(
+		context.Background(), "Long PDF", "long.pdf", []byte("%PDF-1.7\nmany pages"), "admin-1", &mockEmbedder{},
+	)
+	if !errors.Is(err, ErrExtractionFailed) {
+		t.Fatalf("expected extraction failure, got %v", err)
+	}
+	stored, getErr := store.GetDocument(context.Background(), doc.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if stored.Status != "failed" || !strings.Contains(stored.ErrorMessage, "100-page processing limit") {
+		t.Fatalf("expected actionable extraction error, got %+v", stored)
 	}
 }

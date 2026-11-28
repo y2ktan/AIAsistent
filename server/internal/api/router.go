@@ -84,6 +84,10 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("POST /api/v1/admin/documents",
 		auth.RateLimitMiddleware(uploadLimiter, auth.ClientIP)(admin(s.HandleUploadDocument)),
 	)
+	mux.Handle("POST /api/v1/admin/documents/{id}/replace",
+		auth.RateLimitMiddleware(uploadLimiter, auth.ClientIP)(admin(s.HandleReplaceFailedPDF)),
+	)
+	mux.Handle("POST /api/v1/admin/documents/{id}/sync", admin(s.HandleSyncHostedDocument))
 	mux.Handle("POST /api/v1/admin/documents/{id}/reindex", admin(s.HandleReindexDocument))
 	mux.Handle("DELETE /api/v1/admin/documents/{id}", admin(s.HandleDeleteDocument))
 

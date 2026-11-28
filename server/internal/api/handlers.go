@@ -245,6 +245,79 @@ func (s *Server) HandleUploadDocument(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"document": doc})
 }
 
+func (s *Server) HandleReplaceFailedPDF(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, rag.DefaultMaxUploadBytes+1024*1024)
+	if err := r.ParseMultipartForm(rag.DefaultMaxUploadBytes); err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "replacement upload exceeds maximum size"})
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file field"})
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(file, rag.DefaultMaxUploadBytes+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read replacement file"})
+		return
+	}
+	if int64(len(data)) > rag.DefaultMaxUploadBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": rag.ErrPayloadTooLarge.Error()})
+		return
+	}
+
+	embedder, _ := s.activeEmbedder(r.Context())
+	doc, err := s.ragSvc.ReplaceFailedPDF(r.Context(), r.PathValue("id"), header.Filename, data, embedder)
+	if errors.Is(err, rag.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
+		return
+	}
+	if errors.Is(err, rag.ErrDocumentNotFailed) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "only failed PDF documents can be replaced"})
+		return
+	}
+	if errors.Is(err, rag.ErrPayloadTooLarge) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": rag.ErrPayloadTooLarge.Error()})
+		return
+	}
+	if errors.Is(err, rag.ErrUnsupportedType) || errors.Is(err, rag.ErrEmptyFile) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		if doc == nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to process replacement PDF"})
+			return
+		}
+		s.audit(r.Context(), r, "admin.rag.replace", "document", doc.ID, "failed", map[string]any{"status": doc.Status})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"document": doc,
+			"warning":  "Replacement was not indexed: " + doc.ErrorMessage,
+		})
+		return
+	}
+
+	s.audit(r.Context(), r, "admin.rag.replace", "document", doc.ID, "success", map[string]any{"filename": doc.Filename, "chunks": doc.ChunkCount})
+	if syncErr := s.syncHostedDocumentsIfActive(r.Context()); syncErr != nil {
+		updated, getErr := s.ragSvc.GetDocument(r.Context(), doc.ID)
+		if getErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"error": "Document is ready locally, but hosted sync failed and its status could not be loaded.",
+			})
+			return
+		}
+		doc = updated
+		writeJSON(w, http.StatusOK, map[string]any{
+			"document": doc,
+			"warning":  "Replacement is ready locally, but hosted synchronization failed: " + syncErr.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"document": doc})
+}
+
 func (s *Server) HandleReindexDocument(w http.ResponseWriter, r *http.Request) {
 	docID := r.PathValue("id")
 	if _, err := s.ragSvc.GetDocument(r.Context(), docID); errors.Is(err, rag.ErrNotFound) {
@@ -281,6 +354,53 @@ func (s *Server) HandleReindexDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"document": doc})
+}
+
+func (s *Server) HandleSyncHostedDocument(w http.ResponseWriter, r *http.Request) {
+	config, err := s.adminStore.GetAgentConfig(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load saved hosted synchronization policy"})
+		return
+	}
+	if config == nil || config.Mode != "elevenlabs_agent" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Switch to hosted mode before synchronizing application documents."})
+		return
+	}
+	if !config.ElevenLabsRAGSyncEnabled {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Application RAG synchronization is disabled. Enable and save it in AI Agent settings before retrying."})
+		return
+	}
+	docID := r.PathValue("id")
+	doc, err := s.ragSvc.GetDocument(r.Context(), docID)
+	if errors.Is(err, rag.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "document not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load document"})
+		return
+	}
+	if doc.Status != "ready" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Document must be locally ready before hosted synchronization."})
+		return
+	}
+
+	err = s.syncHostedDocument(r.Context(), config, docID)
+	updated, getErr := s.ragSvc.GetDocument(r.Context(), docID)
+	if getErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "hosted synchronization completed but document status could not be loaded"})
+		return
+	}
+	if err != nil {
+		s.audit(r.Context(), r, "admin.rag.hosted_sync", "document", docID, "failed", map[string]any{"status": updated.ElevenLabsSyncStatus})
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":    "Hosted document synchronization failed. Review the row status and retry.",
+			"document": updated,
+		})
+		return
+	}
+	s.audit(r.Context(), r, "admin.rag.hosted_sync", "document", docID, "success", map[string]any{"status": updated.ElevenLabsSyncStatus})
+	writeJSON(w, http.StatusOK, map[string]any{"document": updated})
 }
 
 func (s *Server) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {

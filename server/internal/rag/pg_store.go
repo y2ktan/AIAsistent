@@ -78,6 +78,55 @@ func (s *PGStore) ReplaceDocumentChunks(ctx context.Context, docID string, chunk
 	return tx.Commit(ctx)
 }
 
+func (s *PGStore) ReplaceFailedDocument(
+	ctx context.Context,
+	docID, filename, mimeType string,
+	sizeBytes int64,
+	sha256Hash string,
+	chunks []DocumentChunk,
+	extractedText string,
+) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status, currentMimeType string
+	if err := tx.QueryRow(ctx, `
+		SELECT status, mime_type FROM documents WHERE id = $1::uuid FOR UPDATE
+	`, docID).Scan(&status, &currentMimeType); errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if status != "failed" || currentMimeType != "application/pdf" {
+		return ErrDocumentNotFailed
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM document_chunks WHERE document_id = $1::uuid`, docID); err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO document_chunks (document_id, chunk_index, content, token_count, embedding)
+			VALUES ($1::uuid, $2, $3, $4, $5)
+		`, docID, chunk.ChunkIndex, chunk.Content, chunk.TokenCount, pgvector.NewVector(chunk.Embedding)); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE documents
+		SET filename = $2, mime_type = $3, size_bytes = $4, sha256_hash = $5,
+		    status = 'ready', error_message = '', chunk_count = $6, extracted_text = $7,
+		    elevenlabs_sync_status = 'not_synced', elevenlabs_sync_error = '', updated_at = NOW()
+		WHERE id = $1::uuid
+	`, docID, filename, mimeType, sizeBytes, sha256Hash, len(chunks), extractedText); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *PGStore) DeleteDocument(ctx context.Context, docID string) error {
 	ct, err := s.pool.Exec(ctx, `DELETE FROM documents WHERE id = $1::uuid`, docID)
 	if err != nil {

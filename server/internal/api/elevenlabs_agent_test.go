@@ -772,6 +772,141 @@ func TestHostedDocumentSyncThresholdAndPreservesDashboardEntries(t *testing.T) {
 	}
 }
 
+func TestTargetedHostedDocumentSyncPreservesUnmanagedEntries(t *testing.T) {
+	agentResponse := hostedAgentWithKnowledgeBase(
+		`{"id":"dashboard_doc","name":"Dashboard policy","type":"text","usage_mode":"auto"},` +
+			`{"id":"local_other","name":"Other app policy","type":"text","usage_mode":"auto"}`,
+	)
+	var providerCalls, createCalls, indexCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/convai/agents/"):
+			_, _ = w.Write([]byte(agentResponse))
+		case r.Method == http.MethodPatch:
+			var patch map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				t.Errorf("decode targeted sync patch: %v", err)
+				http.Error(w, "bad patch", http.StatusBadRequest)
+				return
+			}
+			current := map[string]any{}
+			if err := json.Unmarshal([]byte(agentResponse), &current); err != nil {
+				t.Fatal(err)
+			}
+			currentConfig := current["conversation_config"].(map[string]any)
+			currentPrompt := currentConfig["agent"].(map[string]any)["prompt"].(map[string]any)
+			patchConfig := patch["conversation_config"].(map[string]any)
+			patchPrompt := patchConfig["agent"].(map[string]any)["prompt"].(map[string]any)
+			currentPrompt["knowledge_base"] = patchPrompt["knowledge_base"]
+			currentPrompt["rag"] = patchPrompt["rag"]
+			encoded, err := json.Marshal(current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agentResponse = string(encoded)
+			_, _ = w.Write(encoded)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/convai/knowledge-base/text":
+			createCalls.Add(1)
+			_, _ = w.Write([]byte(`{"id":"kb_target"}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rag-index"):
+			indexCalls.Add(1)
+			documentID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/convai/knowledge-base/"), "/rag-index")
+			_, _ = w.Write([]byte(`{"id":"` + documentID + `","status":"succeeded"}`))
+		default:
+			t.Errorf("unexpected targeted sync provider request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	previous := elevenLabsAdminAPIBaseURL
+	elevenLabsAdminAPIBaseURL = upstream.URL
+	defer func() { elevenLabsAdminAPIBaseURL = previous }()
+
+	store, router, cookie := newHostedAPITest(t, auth.RoleAdmin)
+	store.agentCfg.Mode = "elevenlabs_agent"
+	seedHostedDocument(store, rag.Document{
+		ID: "local-target", Title: "Target policy", ExtractedText: strings.Repeat("target policy ", 50),
+	})
+	seedHostedDocument(store, rag.Document{
+		ID: "local-other-doc", Title: "Other app policy", ExtractedText: strings.Repeat("other policy ", 50),
+		ElevenLabsDocID: "local_other", ElevenLabsAgentID: "agent_fixture",
+		ElevenLabsSyncedHash: "existing-hash", ElevenLabsSyncStatus: "synced",
+	})
+
+	response := hostedAPIRequest(
+		router, cookie, http.MethodPost, "/api/v1/admin/documents/local-target/sync", `{}`,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("targeted document sync failed: %d %s", response.Code, response.Body.String())
+	}
+	if createCalls.Load() != 1 || indexCalls.Load() != 1 {
+		t.Fatalf("expected only the selected document to upload/index, got uploads=%d indexes=%d", createCalls.Load(), indexCalls.Load())
+	}
+	var result struct {
+		Document rag.Document `json:"document"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Document.ElevenLabsSyncStatus != "synced" {
+		t.Fatalf("targeted document status was not updated: %+v", result.Document)
+	}
+	storedTarget, err := store.ragStore.GetDocument(context.Background(), "local-target")
+	if err != nil || storedTarget.ElevenLabsDocID != "kb_target" {
+		t.Fatalf("hosted document ID was not stored: doc=%+v err=%v", storedTarget, err)
+	}
+
+	var agentState map[string]any
+	if err := json.Unmarshal([]byte(agentResponse), &agentState); err != nil {
+		t.Fatal(err)
+	}
+	conversationConfig := agentState["conversation_config"].(map[string]any)
+	promptConfig := conversationConfig["agent"].(map[string]any)["prompt"].(map[string]any)
+	entries := promptConfig["knowledge_base"].([]any)
+	found := map[string]bool{}
+	for _, raw := range entries {
+		found[raw.(map[string]any)["id"].(string)] = true
+	}
+	if !found["dashboard_doc"] || !found["local_other"] || !found["kb_target"] {
+		t.Fatalf("targeted sync removed a dashboard or unrelated managed entry: %#v", entries)
+	}
+	if providerCalls.Load() < 4 {
+		t.Fatalf("expected provider read, upload, index and attachment verification calls; got %d", providerCalls.Load())
+	}
+}
+
+func TestTargetedHostedDocumentSyncPolicyAndReadinessGateProvider(t *testing.T) {
+	var providerCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		http.Error(w, "provider must not be contacted", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	previous := elevenLabsAdminAPIBaseURL
+	elevenLabsAdminAPIBaseURL = upstream.URL
+	defer func() { elevenLabsAdminAPIBaseURL = previous }()
+
+	store, router, cookie := newHostedAPITest(t, auth.RoleAdmin)
+	store.agentCfg.Mode = "elevenlabs_agent"
+	store.agentCfg.ElevenLabsRAGSyncEnabled = false
+	store.ragStore.mu.Lock()
+	store.ragStore.docs["failed-doc"] = &rag.Document{ID: "failed-doc", Status: "failed", MimeType: "application/pdf"}
+	store.ragStore.mu.Unlock()
+	response := hostedAPIRequest(router, cookie, http.MethodPost, "/api/v1/admin/documents/failed-doc/sync", `{}`)
+	if response.Code != http.StatusConflict ||
+		!strings.Contains(strings.ToLower(response.Body.String()), "enable and save") ||
+		providerCalls.Load() != 0 {
+		t.Fatalf("disabled policy was not enforced before provider access: %d %s calls=%d", response.Code, response.Body.String(), providerCalls.Load())
+	}
+
+	store.agentCfg.ElevenLabsRAGSyncEnabled = true
+	response = hostedAPIRequest(router, cookie, http.MethodPost, "/api/v1/admin/documents/failed-doc/sync", `{}`)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "locally ready") || providerCalls.Load() != 0 {
+		t.Fatalf("non-ready document was not rejected before provider access: %d %s calls=%d", response.Code, response.Body.String(), providerCalls.Load())
+	}
+}
+
 func TestHostedDisabledRAGKeepsDocumentLifecycleLocal(t *testing.T) {
 	var knowledgeCalls, attachmentCalls, embeddingCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

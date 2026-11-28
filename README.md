@@ -61,6 +61,20 @@ cp .env.example .env
 | `STUN_URLS` | Comma-separated STUN server URLs (default `stun:stun.l.google.com:19302`) |
 | `BACKEND_INTERNAL_URL` | Internal URL used by Next.js BFF to reach the Go backend (default `http://server:8080`) |
 
+## PDF Extraction and OCR
+
+The server image includes Poppler (`pdftotext`, `pdftoppm`) and Tesseract with English and Simplified/Traditional Chinese language data. Running the Go server directly during local development requires those executables and language packs on `PATH`; on Debian/Ubuntu install them with:
+
+```bash
+sudo apt-get install poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra
+```
+
+The Docker Compose server image installs these runtime dependencies automatically.
+
+PDF extraction supports up to 100 pages, a 10-minute processing timeout, and 10 MiB of extracted text. Scanned PDFs use local Tesseract OCR.
+
+For a failed PDF, open **`/admin` → RAG Knowledge**, review the sanitized extraction error, and choose **Replace PDF** on that row. The corrected PDF is processed locally and its source bytes are not retained; invalid replacements leave the failed record unchanged. After it reaches `ready`, hosted synchronization follows the saved application RAG policy.
+
 ## Local Ollama Setup
 
 Run `./setup-local-ai.sh` to configure the local AI stack. Its default LLM is `qwen3.8:latest`; override it with `OLLAMA_LLM_MODEL=<model-name> ./setup-local-ai.sh`. The script pulls the model if needed and updates the default agent configuration.

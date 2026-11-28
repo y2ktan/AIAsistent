@@ -25,6 +25,8 @@ const mcpMocks = vi.hoisted(() => ({
   documents: [] as Record<string, unknown>[],
   hostedSyncCalls: 0,
   hostedSyncError: "",
+  documentSyncCalls: [] as string[],
+  documentSyncStatus: "synced",
 }));
 
 vi.mock("next/navigation", () => {
@@ -48,6 +50,15 @@ vi.mock("@/lib/api-client", () => ({
     }
     if (path.endsWith("/users")) return { users: [] };
     if (path.endsWith("/documents")) return { documents: mcpMocks.documents };
+    if (path.endsWith("/sync") && path.includes("/documents/")) {
+      const docId = path.split("/").at(-2) || "";
+      mcpMocks.documentSyncCalls.push(docId);
+      const updated = mcpMocks.documents.map((doc) =>
+        doc.id === docId ? { ...doc, elevenLabsSyncStatus: mcpMocks.documentSyncStatus } : doc
+      );
+      mcpMocks.documents = updated;
+      return { document: updated.find((doc) => doc.id === docId) };
+    }
     if (path.endsWith("/agent-config/sync")) {
       mcpMocks.hostedSyncCalls++;
       if (mcpMocks.hostedSyncError) throw new Error(mcpMocks.hostedSyncError);
@@ -120,6 +131,8 @@ describe("admin form autofill settings", () => {
     mcpMocks.documents = [];
     mcpMocks.hostedSyncCalls = 0;
     mcpMocks.hostedSyncError = "";
+    mcpMocks.documentSyncCalls = [];
+    mcpMocks.documentSyncStatus = "synced";
   });
 
   afterEach(async () => {
@@ -169,6 +182,70 @@ describe("admin form autofill settings", () => {
     expect(serverUrl?.getAttribute("autocomplete")).toBe("off");
     expect(bearerToken?.value).toBe("");
     expect(bearerToken?.getAttribute("autocomplete")).toBe("new-password");
+  });
+
+  it("explains disabled per-document sync policy", async () => {
+    mcpMocks.agentConfig = {
+      mode: "elevenlabs_agent",
+      elevenLabsRagSyncEnabled: false,
+      elevenLabsAgentSkillsSyncEnabled: true,
+    };
+    mcpMocks.documents = [{
+      id: "doc-1",
+      title: "Support policy",
+      filename: "support.pdf",
+      status: "ready",
+      chunkCount: 2,
+      elevenLabsSyncStatus: "failed",
+      elevenLabsSyncError: "Provider unavailable.",
+    }];
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => root.render(createElement(AdminPage)));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    const ragTab = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("RAG Knowledge")
+    );
+    await act(async () => ragTab?.click());
+
+    const syncButton = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Sync / retry"
+    );
+    expect(syncButton?.disabled).toBe(true);
+    expect(container.textContent).toContain("Enable and save in AI Agent settings");
+    expect(container.textContent).toContain("Application sync disabled");
+    expect(mcpMocks.documentSyncCalls).toHaveLength(0);
+  });
+
+  it.each(["synced", "indexing", "failed"] as const)("syncs one ready document and refreshes the %s status", async (status) => {
+    mcpMocks.agentConfig = { mode: "elevenlabs_agent", elevenLabsRagSyncEnabled: true };
+    mcpMocks.documents = [{
+      id: "doc-2",
+      title: "Operations policy",
+      filename: "operations.pdf",
+      status: "ready",
+      chunkCount: 1,
+      elevenLabsSyncStatus: "not_synced",
+    }];
+    mcpMocks.documentSyncStatus = status;
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root.render(createElement(AdminPage)));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.includes("RAG Knowledge"))
+        ?.click();
+    });
+    const syncButton = Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Sync / retry"
+    );
+    await act(async () => syncButton?.click());
+    expect(mcpMocks.documentSyncCalls).toEqual(["doc-2"]);
+    expect(container.textContent).toContain(status);
   });
 
   it("renders Audio Focus enabled by default in AI Agent settings", async () => {
